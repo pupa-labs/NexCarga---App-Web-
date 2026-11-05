@@ -1,0 +1,72 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --nex-orange: #FF8A00;
+    --nex-orange-dark: #E85D04;
+    --nex-black: #111111;
+    --nex-graphite: #292929;
+    --nex-white: #FFFFFF;
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+  }
+
+  body {
+    font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    font-feature-settings: "cv02", "cv03", "cv04", "cv11";
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: 'Outfit', 'Plus Jakarta Sans', sans-serif;
+  }
+
+  .font-mono, .tabular-nums {
+    font-family: 'JetBrains Mono', monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+/* Custom subtle scrollbars for NEXOS dark surfaces */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: rgba(17, 17, 17, 0.6);
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.14);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 138, 0, 0.5);
+}
+
+/* Custom Range Input for NEXGRID Radius Slider */
+input[type="range"].nex-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  border-radius: 999px;
+  outline: none;
+}
+input[type="range"].nex-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #FF8A00;
+  border: 2px solid #FFF3E0;
+  box-shadow: 0 0 10px rgba(255, 138, 0, 0.8);
+  cursor: pointer;
+}
+input[type="range"].nex-slider::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #FF8A00;
+  border: 2px solid #FFF3E0;
+  box-shadow: 0 0 10px rgba(255, 138, 0, 0.8);
+  cursor: pointer;
+}

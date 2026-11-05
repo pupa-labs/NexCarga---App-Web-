@@ -1,0 +1,6 @@
+{
+  "name": "NexCarga — LogTech SaaS B2B",
+  "description": "Plataforma SaaS B2B de logística e intermediação de fretes da Pupa Labs. Sua carga. Nossa conexão.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -27,8 +27,12 @@ import type {
   CommercialSettings,
   ContractItem,
   DelinquencyPolicy,
+  DocumentItem,
   FeeRuleItem,
   IntegrationStatus,
+  NexCargaTrustHistoryItem,
+  NexCargaTrustStatus,
+  NexCargaTrustVerificationItem,
   OrganizationItem,
   PartnerCommissionItem,
   PartnerItem,
@@ -40,6 +44,7 @@ import type {
   UserRole,
 } from '../types/nexcarga';
 import { formatBrl, formatDateBr, hasAdminPermission } from '../utils/logisticsRules';
+import { NexCargaVerifiedBadge, TRUST_STATUS_LABELS } from './UserProfileAndTrustView';
 
 interface NexCargaControlViewProps {
   activeProfile: ActiveProfileSession;
@@ -58,12 +63,16 @@ interface NexCargaControlViewProps {
   commercialSettings: CommercialSettings;
   auditLogs: AuditLogItem[];
   integrations: IntegrationStatus;
+  trustVerifications?: NexCargaTrustVerificationItem[];
+  trustHistory?: NexCargaTrustHistoryItem[];
+  documents?: DocumentItem[];
   onRefresh: () => Promise<void>;
   onShowToast: (msg: string) => void;
 }
 
 type ControlTabId =
   | 'overview'
+  | 'trust'
   | 'users'
   | 'organizations'
   | 'plans'
@@ -93,11 +102,18 @@ export const NexCargaControlView: React.FC<NexCargaControlViewProps> = ({
   commercialSettings,
   auditLogs,
   integrations,
+  trustVerifications = [],
+  trustHistory = [],
+  documents = [],
   onRefresh,
   onShowToast,
 }) => {
   const [activeTab, setActiveTab] = useState<ControlTabId>('overview');
   const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [trustStatusFilter, setTrustStatusFilter] = useState<string>('ALL');
+  const [adminTrustReason, setAdminTrustReason] = useState<string>(
+    'Homologação documental e cadastral confirmada pelo setor NEXCARGA TRUST.'
+  );
 
   // 5.2 Users filter state
   const [userSearch, setUserSearch] = useState('');
@@ -200,6 +216,7 @@ export const NexCargaControlView: React.FC<NexCargaControlViewProps> = ({
 
   const tabs: Array<{ id: ControlTabId; label: string; icon: React.FC<{ className?: string }> }> = [
     { id: 'overview', label: 'Visão Geral', icon: Activity },
+    { id: 'trust', label: 'NEXCARGA TRUST & Homologação', icon: ShieldCheck },
     { id: 'users', label: 'Usuários', icon: Users },
     { id: 'organizations', label: 'Organizações', icon: Building2 },
     { id: 'plans', label: 'Planos', icon: FileSpreadsheet },
@@ -471,7 +488,14 @@ export const NexCargaControlView: React.FC<NexCargaControlViewProps> = ({
                   {filteredUsers.map((u) => (
                     <tr key={u.id} className="hover:bg-white/[0.02]">
                       <td className="py-3 px-4">
-                        <strong className="text-white block">{u.fullName}</strong>
+                        <div className="flex items-center gap-1.5">
+                          <strong className="text-white">{u.fullName}</strong>
+                          <NexCargaVerifiedBadge
+                            verified={u.verifiedBadge}
+                            trustStatus={u.trustStatus}
+                            variant="inline"
+                          />
+                        </div>
                         <span className="text-neutral-400 text-[11px]">{u.email}</span>
                       </td>
                       <td className="py-3 px-4 font-mono text-neutral-300">{u.cpfOrCnpj}</td>
@@ -626,7 +650,14 @@ export const NexCargaControlView: React.FC<NexCargaControlViewProps> = ({
                     {org.status === 'ACTIVE' ? 'Organização Ativa' : 'Suspensa'}
                   </span>
                 </div>
-                <h3 className="text-base font-bold text-white">{org.tradeName}</h3>
+                <div className="flex items-center gap-2">
+                  <h3 className="text-base font-bold text-white">{org.tradeName}</h3>
+                  <NexCargaVerifiedBadge
+                    verified={org.verifiedBadge}
+                    trustStatus={org.trustStatus}
+                    variant="inline"
+                  />
+                </div>
                 <p className="text-neutral-400">
                   Razão Social: {org.legalName} • CNPJ/CPF:{' '}
                   <strong className="font-mono text-neutral-200">{org.cnpjOrCpf}</strong>
@@ -1694,6 +1725,262 @@ export const NexCargaControlView: React.FC<NexCargaControlViewProps> = ({
             Salvar Configurações Gerais
           </button>
         </form>
+      )}
+
+      {/* =================================================================== */}
+      {/* 5.11 NEXCARGA TRUST & HOMOLOGAÇÃO CADASTRAL (ADMINISTRAÇÃO)         */}
+      {/* =================================================================== */}
+      {activeTab === 'trust' && (
+        <div className="space-y-4" data-testid="admin-trust-tab">
+          <div className="rounded-2xl bg-[#181818] border border-white/[0.08] p-4 flex flex-wrap items-center justify-between gap-3 text-xs">
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                <ShieldCheck className="w-4 h-4 text-[#FF8A00]" />
+                <span>
+                  Central Administrativa NEXCARGA TRUST — Aprovação Cadastral e Selo Oficial
+                </span>
+              </h3>
+              <p className="text-neutral-400 mt-0.5">
+                Analise cadastros pendentes, aprove ou reprove documentos com justificativa obrigatória, suspenda ou reative o selo NEXCARGA VERIFICADO.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <select
+                value={trustStatusFilter}
+                onChange={(e) => setTrustStatusFilter(e.target.value)}
+                aria-label="Filtrar status de verificação"
+                className="rounded-lg bg-[#232328] border border-white/10 px-3 py-2 text-white"
+              >
+                <option value="ALL">Todos os Cadastros ({trustVerifications.length})</option>
+                <option value="VERIFIED">Aprovados — VERIFIED</option>
+                <option value="UNDER_REVIEW">Em Análise — UNDER_REVIEW</option>
+                <option value="EXPIRED">Documento Vencido — EXPIRED</option>
+                <option value="PENDING">Pendentes — PENDING</option>
+                <option value="REJECTED">Reprovados — REJECTED</option>
+                <option value="SUSPENDED">Suspensos — SUSPENDED</option>
+              </select>
+            </div>
+          </div>
+
+          <div className="rounded-2xl bg-[#181818] border border-white/[0.08] p-4 text-xs">
+            <label htmlFor="admin-trust-reason" className="block text-neutral-400 mb-1">
+              Justificativa / Parecer de Homologação ou Reprovação (Obrigatório em reprovações e suspensões):
+            </label>
+            <input
+              id="admin-trust-reason"
+              type="text"
+              value={adminTrustReason}
+              onChange={(e) => setAdminTrustReason(e.target.value)}
+              className="w-full rounded-lg bg-[#232328] border border-white/10 px-3 py-2 text-white"
+            />
+          </div>
+
+          <div className="space-y-3">
+            {trustVerifications
+              .filter(
+                (tv) => trustStatusFilter === 'ALL' || tv.trustStatus === trustStatusFilter
+              )
+              .map((tv) => {
+                const statusMeta = TRUST_STATUS_LABELS[tv.trustStatus];
+                const orgDocs = documents.filter((d) => d.organizationId === tv.organizationId);
+                return (
+                  <div
+                    key={tv.id}
+                    className="rounded-2xl bg-[#181818] border border-white/[0.08] p-5 space-y-3 text-xs"
+                  >
+                    <div className="flex flex-wrap items-start justify-between gap-3">
+                      <div className="space-y-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <strong className="text-base text-white">{tv.organizationName}</strong>
+                          <span className="font-mono text-neutral-400">
+                            ({tv.organizationCnpjOrCpf})
+                          </span>
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full border text-[11px] font-bold ${statusMeta.badgeClass}`}
+                          >
+                            {statusMeta.label}
+                          </span>
+                          <NexCargaVerifiedBadge
+                            verified={tv.verifiedBadge}
+                            trustStatus={tv.trustStatus}
+                            variant="inline"
+                          />
+                        </div>
+                        <p className="text-neutral-300">
+                          Titular: <strong className="text-white">{tv.userName}</strong> (
+                          {tv.entityCategoryLabel}) • Submetido em:{' '}
+                          {formatDateBr(tv.submittedAt)}
+                          {tv.reviewedBy && ` • Revisado por: ${tv.reviewedBy}`}
+                        </p>
+                        <p className="text-neutral-400">{tv.regularizationInstructions}</p>
+                      </div>
+
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            callAdminApi(
+                              `/api/admin/trust/${tv.id}/status`,
+                              'POST',
+                              {
+                                trustStatus: 'VERIFIED' as NexCargaTrustStatus,
+                                reason: adminTrustReason,
+                              },
+                              `Cadastro de ${tv.organizationName} aprovado com Selo NEXCARGA VERIFICADO!`
+                            )
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 font-bold cursor-pointer"
+                        >
+                          Aprovar Selo VERIFICADO
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            callAdminApi(
+                              `/api/admin/trust/${tv.id}/status`,
+                              'POST',
+                              {
+                                trustStatus: 'ACTION_REQUIRED' as NexCargaTrustStatus,
+                                reason: adminTrustReason,
+                              },
+                              `Solicitada regularização documental para ${tv.organizationName}.`
+                            )
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-[#FF8A00]/20 hover:bg-[#FF8A00]/30 text-[#FF8A00] font-bold cursor-pointer"
+                        >
+                          Solicitar Ação
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            callAdminApi(
+                              `/api/admin/trust/${tv.id}/status`,
+                              'POST',
+                              {
+                                trustStatus: 'REJECTED' as NexCargaTrustStatus,
+                                reason: adminTrustReason,
+                              },
+                              `Verificação de ${tv.organizationName} reprovada.`
+                            )
+                          }
+                          className="px-3 py-1.5 rounded-lg bg-red-500/20 hover:bg-red-500/30 text-red-300 font-bold cursor-pointer"
+                        >
+                          Reprovar
+                        </button>
+                        {tv.trustStatus === 'VERIFIED' && (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              callAdminApi(
+                                `/api/admin/trust/${tv.id}/status`,
+                                'POST',
+                                {
+                                  trustStatus: 'SUSPENDED' as NexCargaTrustStatus,
+                                  reason: adminTrustReason,
+                                },
+                                `Selo NEXCARGA VERIFICADO de ${tv.organizationName} suspenso.`
+                              )
+                            }
+                            className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 font-bold cursor-pointer"
+                          >
+                            Suspender Selo
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Documentos da Organização */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-2 pt-2 border-t border-white/10">
+                      {orgDocs.map((d) => {
+                        const isDocExpired = new Date(d.expiresAt).getTime() < Date.now();
+                        return (
+                          <div
+                            key={d.id}
+                            className="rounded-xl bg-[#121215] border border-white/5 p-3 flex flex-col justify-between gap-2"
+                          >
+                            <div>
+                              <div className="flex items-center justify-between">
+                                <span className="font-mono font-bold text-[#FF8A00]">
+                                  {d.category}
+                                </span>
+                                <span className="font-mono text-[10px] text-neutral-400">
+                                  {d.storageBucket || d.gcsBucket}
+                                </span>
+                              </div>
+                              <strong className="text-white block mt-0.5">{d.title}</strong>
+                              <span className="text-[11px] text-neutral-400 block">
+                                Validade: {formatDateBr(d.expiresAt)} • Status:{' '}
+                                <strong className={isDocExpired ? 'text-red-400' : 'text-white'}>
+                                  {isDocExpired ? 'EXPIRED' : d.verificationStatus}
+                                </strong>
+                              </span>
+                            </div>
+                            <div className="flex items-center justify-end gap-1.5 pt-1">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  callAdminApi(
+                                    `/api/documents/${d.id}/verify`,
+                                    'POST',
+                                    { status: 'APPROVED' },
+                                    `Documento ${d.title} aprovado!`
+                                  )
+                                }
+                                className="px-2 py-1 rounded bg-emerald-500/20 text-emerald-300 font-semibold text-[11px] cursor-pointer"
+                              >
+                                Aprovar Doc
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  callAdminApi(
+                                    `/api/documents/${d.id}/verify`,
+                                    'POST',
+                                    {
+                                      status: 'REJECTED',
+                                      rejectionReason: adminTrustReason,
+                                    },
+                                    `Documento ${d.title} reprovado.`
+                                  )
+                                }
+                                className="px-2 py-1 rounded bg-red-500/20 text-red-300 font-semibold text-[11px] cursor-pointer"
+                              >
+                                Reprovar Doc
+                              </button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                );
+              })}
+          </div>
+
+          {/* Histórico de Aprovações */}
+          <div className="rounded-2xl bg-[#181818] border border-white/[0.08] p-5 space-y-2 text-xs">
+            <h4 className="font-bold text-white">
+              Histórico Global de Aprovações e Alterações de Status (NEXCARGA TRUST)
+            </h4>
+            {trustHistory.map((th) => (
+              <div
+                key={th.id}
+                className="rounded-xl bg-[#121215] border border-white/5 p-3 flex flex-wrap items-center justify-between gap-2"
+              >
+                <div>
+                  <strong className="text-[#FF8A00] font-mono">{th.actionType}</strong> —{' '}
+                  <strong className="text-white">{th.organizationName}</strong> ({th.previousStatus} →{' '}
+                  <strong className="text-emerald-400">{th.newStatus}</strong>)
+                  <p className="text-neutral-300 mt-0.5">{th.reason}</p>
+                </div>
+                <span className="font-mono text-[11px] text-neutral-400">
+                  {th.actorName} ({th.actorRole}) • {th.createdAt}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
       )}
     </div>
   );

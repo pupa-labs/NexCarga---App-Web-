@@ -24,7 +24,27 @@ export type NavSectionId =
   | 'nexia-verify'
   | 'nexcarga-docs'
   | 'motor-custos'
-  | 'configuracoes';
+  | 'configuracoes'
+  | 'meu-perfil'
+  | 'nexcarga-trust';
+
+export type NexCargaTrustStatus =
+  | 'NOT_SUBMITTED'
+  | 'PENDING'
+  | 'UNDER_REVIEW'
+  | 'ACTION_REQUIRED'
+  | 'VERIFIED'
+  | 'REJECTED'
+  | 'EXPIRED'
+  | 'SUSPENDED';
+
+export type StorageBucketName =
+  | 'driver-documents'
+  | 'company-documents'
+  | 'vehicle-images'
+  | 'freight-attachments'
+  | 'profile-images'
+  | 'nexcarga-private';
 
 export type OperationStatus =
   | 'Aguardando coleta'
@@ -36,9 +56,25 @@ export type OperationStatus =
   | 'Com ocorrência'
   | 'Cancelada';
 
+export interface AuthorizedOrgContext {
+  contextId: string;
+  userId: string;
+  organizationId: string;
+  organizationName: string;
+  organizationCnpjOrCpf: string;
+  role: UserRole;
+  roleLabel: string;
+  trustStatus: NexCargaTrustStatus;
+  verifiedBadge: boolean;
+}
+
 export interface ActiveProfileSession {
   userId: string;
+  authUserId?: string;
   userName: string;
+  email?: string;
+  phone?: string;
+  cpf?: string;
   userTitle: string;
   role: UserRole;
   roleLabel: string;
@@ -48,6 +84,10 @@ export interface ActiveProfileSession {
   city: string;
   uf: string;
   avatarUrl?: string;
+  accountStatus?: UserAccountStatus;
+  trustStatus?: NexCargaTrustStatus;
+  verifiedBadge?: boolean;
+  createdAt?: string;
 }
 
 export interface FreightItem {
@@ -55,6 +95,7 @@ export interface FreightItem {
   code: string;
   organizationId: string;
   organizationName: string;
+  organizationVerified?: boolean;
   originCity: string;
   originUf: string;
   originCep: string;
@@ -98,6 +139,7 @@ export interface ProposalItem {
   destinationLabel: string;
   proposerOrganizationId: string;
   proposerName: string;
+  proposerVerified?: boolean;
   driverName: string;
   driverRntrc: string;
   vehicleDescription: string;
@@ -192,19 +234,37 @@ export interface ActivityEventItem {
 export interface DocumentItem {
   id: string;
   organizationId: string;
+  uploadedByUserId?: string;
   ownerName: string;
   ownerRole: string;
   title: string;
-  category: 'CNH' | 'RNTRC' | 'ANTT' | 'CRLV' | 'NF_E' | 'CT_E' | 'MDF_E' | 'CONTRATO_SOCIAL' | 'COMPROVANTE_ENTREGA';
+  category:
+    | 'CNH'
+    | 'RNTRC'
+    | 'ANTT'
+    | 'CRLV'
+    | 'NF_E'
+    | 'CT_E'
+    | 'MDF_E'
+    | 'CONTRATO_SOCIAL'
+    | 'COMPROVANTE_ENDERECO'
+    | 'CARTAO_CNPJ'
+    | 'COMPROVANTE_ENTREGA';
   documentNumber: string;
+  storageBucket?: StorageBucketName;
   gcsBucket: string;
   gcsObjectPath: string;
   fileSizeLabel: string;
+  isMandatory?: boolean;
+  submittedAt?: string;
+  approvedAt?: string;
   expiresAt: string;
-  verificationStatus: 'PENDING' | 'AI_PRE_CHECKED' | 'APPROVED' | 'REJECTED';
+  verificationStatus: 'PENDING' | 'AI_PRE_CHECKED' | 'APPROVED' | 'REJECTED' | 'EXPIRED';
+  rejectionReason?: string;
   aiAnalysisSummary?: string;
   aiInconsistencies?: string[];
   reviewedBy?: string;
+  reviewedByUserId?: string;
   reviewedAt?: string;
   createdAt: string;
 }
@@ -382,6 +442,8 @@ export interface AdminUserItem {
   status: UserAccountStatus;
   subscriptionStatus: 'ACTIVE' | 'TRIAL' | 'OVERDUE' | 'SUSPENDED' | 'MANUAL_GRANT';
   verificationStatus: 'APPROVED' | 'PENDING' | 'REJECTED';
+  trustStatus?: NexCargaTrustStatus;
+  verifiedBadge?: boolean;
   createdAt: string;
   lastLoginAt: string;
   statusReason?: string;
@@ -402,6 +464,8 @@ export interface OrganizationItem {
   activePlanId: string;
   activePlanName: string;
   status: 'ACTIVE' | 'SUSPENDED' | 'BLOCKED' | 'IN_REVIEW';
+  trustStatus?: NexCargaTrustStatus;
+  verifiedBadge?: boolean;
   publishedFreightsCount: number;
   completedContractsCount: number;
   financialVolumeBrl: number;
@@ -571,9 +635,116 @@ export interface GeocodeAddressResponse {
   validated: boolean;
 }
 
+export interface UserProfileAccount {
+  userId: string;
+  authUserId: string;
+  fullName: string;
+  email: string;
+  phone: string;
+  cpf: string;
+  jobTitle: string;
+  role: UserRole;
+  roleLabel: string;
+  organizationId: string;
+  organizationName: string;
+  organizationCnpjOrCpf: string;
+  city: string;
+  uf: string;
+  avatarUrl: string;
+  avatarBucket: StorageBucketName;
+  createdAt: string;
+  accountStatus: UserAccountStatus;
+  trustStatus: NexCargaTrustStatus;
+  verifiedBadge: boolean;
+  twoFactorEnabled: boolean;
+  lastPasswordUpdateAt: string;
+  activeSessionsCount: number;
+  notificationPreferences: {
+    emailAlerts: boolean;
+    pushNotifications: boolean;
+    whatsappOperational: boolean;
+    securityAlerts: boolean;
+    proposalsAndContracts?: boolean;
+    documentExpirationWarnings?: boolean;
+    communicationFrequency?: 'IMMEDIATE' | 'DAILY_DIGEST' | 'CRITICAL_ONLY';
+    preferredChannel?: 'WHATSAPP_AND_EMAIL' | 'EMAIL_ONLY' | 'PUSH_AND_WHATSAPP';
+  };
+  accountSettings?: {
+    languageRegion: 'pt-BR';
+    timezone: string;
+    defaultWeightUnit: 'TONS' | 'KG';
+    defaultLandingSection: NavSectionId;
+    profileVisibility: 'PUBLIC_VERIFIED' | 'CONTRACTED_ONLY';
+    shareRadarTelemetry: boolean;
+    lgpdConsentActive: boolean;
+    sessionTimeoutMinutes: 30 | 120 | 480;
+    requireDeviceConfirmation: boolean;
+  };
+}
+
+export type TrustEntityCategory =
+  | 'DRIVER'
+  | 'CARRIER'
+  | 'COMPANY_SHIPPER'
+  | 'COMPANY_PROVIDER'
+  | 'COMMERCIAL_PARTNER';
+
+export interface NexCargaTrustRequirement {
+  category: DocumentItem['category'];
+  label: string;
+  bucket: StorageBucketName;
+  mandatory: boolean;
+  description: string;
+}
+
+export interface NexCargaTrustVerificationItem {
+  id: string;
+  organizationId: string;
+  organizationName: string;
+  organizationCnpjOrCpf: string;
+  userId: string;
+  userName: string;
+  userRole: UserRole;
+  entityCategory: TrustEntityCategory;
+  entityCategoryLabel: string;
+  trustStatus: NexCargaTrustStatus;
+  verifiedBadge: boolean;
+  pendingRequirements: string[];
+  regularizationInstructions: string;
+  rejectionReason?: string;
+  suspensionReason?: string;
+  submittedAt: string;
+  reviewedAt?: string;
+  reviewedBy?: string;
+  reviewedByUserId?: string;
+  expiresAt?: string;
+  requiredDocuments: NexCargaTrustRequirement[];
+}
+
+export interface NexCargaTrustHistoryItem {
+  id: string;
+  verificationId: string;
+  organizationId: string;
+  organizationName: string;
+  documentId?: string;
+  documentTitle?: string;
+  actorId: string;
+  actorName: string;
+  actorRole: UserRole;
+  previousStatus: NexCargaTrustStatus | string;
+  newStatus: NexCargaTrustStatus | string;
+  actionType: string;
+  reason: string;
+  createdAt: string;
+}
+
 export interface BootstrapResponse {
   activeProfile: ActiveProfileSession;
   availableProfiles: ActiveProfileSession[];
+  authorizedContexts: AuthorizedOrgContext[];
+  userProfile: UserProfileAccount;
+  trustVerification: NexCargaTrustVerificationItem;
+  trustHistory: NexCargaTrustHistoryItem[];
   kpis: DashboardKPIs;
   freights: FreightItem[];
   proposals: ProposalItem[];
@@ -606,5 +777,7 @@ export interface BootstrapResponse {
     partnerCommissions: PartnerCommissionItem[];
     rolePermissions: RolePermissionMatrix;
     platformSettings: PlatformGeneralSettings;
+    trustVerifications?: NexCargaTrustVerificationItem[];
+    trustHistory?: NexCargaTrustHistoryItem[];
   };
 }

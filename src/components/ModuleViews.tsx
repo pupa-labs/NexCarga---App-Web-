@@ -21,10 +21,13 @@ import type {
   FreightItem,
   IntegrationStatus,
   NavSectionId,
+  NexCargaTrustHistoryItem,
+  NexCargaTrustVerificationItem,
   OperationItem,
   OperationStatus,
   PartnerItem,
   ProposalItem,
+  UserProfileAccount,
   VehicleItem,
 } from '../types/nexcarga';
 import {
@@ -33,10 +36,21 @@ import {
   formatDateBr,
 } from '../utils/logisticsRules';
 import { NexCargaControlView } from './NexCargaControlView';
+import {
+  NexCargaTrustView,
+  NexCargaVerifiedBadge,
+  type ProfileSubTabId,
+  UserProfileView,
+} from './UserProfileAndTrustView';
 
 interface ModuleViewsProps {
   activeSection: NavSectionId;
   activeProfile: ActiveProfileSession;
+  userProfile: UserProfileAccount;
+  trustVerification: NexCargaTrustVerificationItem;
+  trustHistory: NexCargaTrustHistoryItem[];
+  profileInitialTab?: ProfileSubTabId;
+  onNavigateSection: (sec: NavSectionId) => void;
   freights: FreightItem[];
   proposals: ProposalItem[];
   contracts: ContractItem[];
@@ -64,7 +78,11 @@ interface ModuleViewsProps {
     documentNumber: string;
     expiresAt: string;
   }) => Promise<void>;
-  onVerifyDocument: (docId: string, status: 'APPROVED' | 'REJECTED') => Promise<void>;
+  onVerifyDocument: (
+    docId: string,
+    status: 'APPROVED' | 'REJECTED',
+    rejectionReason?: string
+  ) => Promise<void>;
   onUpdateCommercialSettings: (payload: {
     companyFeePercent: number;
     providerFeePercent: number;
@@ -76,6 +94,11 @@ interface ModuleViewsProps {
 export const ModuleViews: React.FC<ModuleViewsProps> = ({
   activeSection,
   activeProfile,
+  userProfile,
+  trustVerification,
+  trustHistory,
+  profileInitialTab = 'profile-personal',
+  onNavigateSection,
   freights,
   proposals,
   contracts,
@@ -131,6 +154,38 @@ export const ModuleViews: React.FC<ModuleViewsProps> = ({
   const [docNumber, setDocNumber] = useState('');
   const [docExpires, setDocExpires] = useState('2028-10-15');
 
+  // 0. MEU PERFIL (PÁGINA COMPLETA DE PERFIL DO USUÁRIO)
+  if (activeSection === 'meu-perfil') {
+    return (
+      <UserProfileView
+        activeProfile={activeProfile}
+        userProfile={userProfile}
+        trustVerification={trustVerification}
+        initialTab={profileInitialTab}
+        onRefreshBootstrap={onRefreshBootstrap}
+        onShowToast={onShowToast}
+        onNavigateToTrust={() => onNavigateSection('nexcarga-trust')}
+        onNavigateToDocs={() => onNavigateSection('documentos')}
+      />
+    );
+  }
+
+  // 0.1 NEXCARGA TRUST (VERIFICAÇÃO CADASTRAL OFICIAL + SELO NEXCARGA VERIFICADO)
+  if (activeSection === 'nexcarga-trust') {
+    return (
+      <NexCargaTrustView
+        activeProfile={activeProfile}
+        trustVerification={trustVerification}
+        trustHistory={trustHistory}
+        documents={documents}
+        onUploadDocument={onUploadDocument}
+        onVerifyDocument={onVerifyDocument}
+        onRefreshBootstrap={onRefreshBootstrap}
+        onShowToast={onShowToast}
+      />
+    );
+  }
+
   // 1. FRETES (Marketplace)
   if (activeSection === 'fretes') {
     return (
@@ -175,8 +230,14 @@ export const ModuleViews: React.FC<ModuleViewsProps> = ({
                     <td className="py-3 px-4 font-mono text-[#FF8A00] font-semibold">{f.code}</td>
                     <td className="py-3 px-4 text-white font-medium">
                       {f.originCity}/{f.originUf} → {f.destinationCity}/{f.destinationUf}
-                      <span className="block text-[11px] text-neutral-500">
-                        Coleta: {formatDateBr(f.pickupDate)} • {f.organizationName}
+                      <span className="flex items-center gap-1.5 text-[11px] text-neutral-400 mt-0.5">
+                        <span>
+                          Coleta: {formatDateBr(f.pickupDate)} • {f.organizationName}
+                        </span>
+                        <NexCargaVerifiedBadge
+                          verified={f.organizationVerified}
+                          variant="inline"
+                        />
                       </span>
                     </td>
                     <td className="py-3 px-4 text-neutral-300">
@@ -261,9 +322,15 @@ export const ModuleViews: React.FC<ModuleViewsProps> = ({
                   </span>
                 </div>
 
-                <p className="text-xs text-neutral-300">
-                  Proponente: <strong className="text-white">{p.proposerName}</strong> • Motorista:{' '}
-                  <strong className="text-white">{p.driverName}</strong> (RNTRC {p.driverRntrc})
+                <p className="text-xs text-neutral-300 flex flex-wrap items-center gap-1.5">
+                  <span>
+                    Proponente: <strong className="text-white">{p.proposerName}</strong>
+                  </span>
+                  <NexCargaVerifiedBadge verified={p.proposerVerified} variant="inline" />
+                  <span>
+                    • Motorista: <strong className="text-white">{p.driverName}</strong> (RNTRC{' '}
+                    {p.driverRntrc})
+                  </span>
                 </p>
                 <p className="text-xs text-neutral-400">
                   Veículo: {p.vehicleDescription} • Prazo estimado: {p.estimatedDeliveryDays} dia(s)
@@ -970,6 +1037,9 @@ export const ModuleViews: React.FC<ModuleViewsProps> = ({
         commercialSettings={commercialSettings}
         auditLogs={auditLogs}
         integrations={integrations}
+        trustVerifications={adminControl.trustVerifications}
+        trustHistory={adminControl.trustHistory}
+        documents={documents}
         onRefresh={onRefreshBootstrap}
         onShowToast={onShowToast}
       />

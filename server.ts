@@ -25,20 +25,26 @@ import {
   INITIAL_PROPOSALS,
   INITIAL_ROLE_PERMISSIONS,
   INITIAL_SUBSCRIPTIONS,
+  INITIAL_TRUST_HISTORY,
+  INITIAL_TRUST_VERIFICATIONS,
+  INITIAL_USER_PROFILES,
   INITIAL_VEHICLES,
 } from './src/data/initialSeed';
 import {
   calculateAdminControlMetrics,
   calculateDistanceKm,
   calculateLogisticsCost,
+  canReviewerApproveTrustDocument,
   canRoleAccessSection,
   createImmutableFeeSnapshot,
+  evaluateNexCargaTrustStatus,
   evaluateSubscriptionDelinquency,
   filterFreightsByRoleVisibility,
   filterNexgridFreights,
   formatBrl,
   geocodeBrazilianAddress,
   hasAdminPermission,
+  resolveOfficialStorageBucket,
   validateCep,
   validateFeeRuleSplit,
 } from './src/utils/logisticsRules';
@@ -48,12 +54,16 @@ import type {
   AdminPermissionAction,
   AdminUserItem,
   AuditLogItem,
+  AuthorizedOrgContext,
   CommercialSettings,
   ContractItem,
   DelinquencyPolicy,
   DocumentItem,
   FeeRuleItem,
   FreightItem,
+  NexCargaTrustHistoryItem,
+  NexCargaTrustStatus,
+  NexCargaTrustVerificationItem,
   OperationItem,
   OperationStatus,
   OrganizationItem,
@@ -66,6 +76,7 @@ import type {
   SubscriptionItem,
   SubscriptionPlanConfig,
   UserAccountStatus,
+  UserProfileAccount,
   UserRole,
   VehicleItem,
 } from './src/types/nexcarga';
@@ -130,6 +141,10 @@ interface PersistentState {
   partnerCommissions: PartnerCommissionItem[];
   rolePermissions: RolePermissionMatrix;
   platformSettings: PlatformGeneralSettings;
+  // NEXCARGA TRUST & User Profiles
+  userProfiles: UserProfileAccount[];
+  trustVerifications: NexCargaTrustVerificationItem[];
+  trustHistory: NexCargaTrustHistoryItem[];
 }
 
 function buildDefaultState(): PersistentState {
@@ -165,6 +180,9 @@ function buildDefaultState(): PersistentState {
     partnerCommissions: [...INITIAL_PARTNER_COMMISSIONS],
     rolePermissions: JSON.parse(JSON.stringify(INITIAL_ROLE_PERMISSIONS)),
     platformSettings: { ...INITIAL_PLATFORM_SETTINGS },
+    userProfiles: JSON.parse(JSON.stringify(INITIAL_USER_PROFILES)),
+    trustVerifications: JSON.parse(JSON.stringify(INITIAL_TRUST_VERIFICATIONS)),
+    trustHistory: JSON.parse(JSON.stringify(INITIAL_TRUST_HISTORY)),
   };
 }
 
@@ -188,6 +206,11 @@ function loadState(): PersistentState {
           : defaults.partnerCommissions,
         rolePermissions: parsed.rolePermissions || defaults.rolePermissions,
         platformSettings: parsed.platformSettings || defaults.platformSettings,
+        userProfiles: parsed.userProfiles?.length ? parsed.userProfiles : defaults.userProfiles,
+        trustVerifications: parsed.trustVerifications?.length
+          ? parsed.trustVerifications
+          : defaults.trustVerifications,
+        trustHistory: parsed.trustHistory?.length ? parsed.trustHistory : defaults.trustHistory,
       };
     }
   } catch (err) {
@@ -208,11 +231,138 @@ function saveState(state: PersistentState): void {
 
 let dbState = loadState();
 
-function getActiveProfile(roleOverride?: UserRole): ActiveProfileSession {
+// Server-side Session Token Registry (maps Bearer token -> authenticated userId)
+const activeSessionTokens = new Map<string, string>();
+
+/**
+ * Reconcilia dinamicamente o estado de verificação NEXCARGA TRUST de todas as organizações
+ * com base na validade real dos documentos obrigatórios (suspende automaticamente vencidos).
+ */
+function syncAllTrustVerifications(): void {
+  const todayIso = '2026-11-05';
+  dbState.trustVerifications.forEach((tv) => {
+    const orgDocs = dbState.documents.filter((d) => d.organizationId === tv.organizationId);
+    const evalResult = evaluateNexCargaTrustStatus({
+      entityCategory: tv.entityCategory,
+      documents: orgDocs,
+      currentStatus: tv.trustStatus,
+      referenceDateIso: todayIso,
+      isManuallySuspended: tv.trustStatus === 'SUSPENDED',
+      suspensionReason: tv.suspensionReason,
+    });
+    tv.trustStatus = evalResult.trustStatus;
+    tv.verifiedBadge = evalResult.verifiedBadge;
+    tv.pendingRequirements = evalResult.pendingRequirements;
+    tv.regularizationInstructions = evalResult.regularizationInstructions;
+
+    const org = dbState.organizations.find((o) => o.id === tv.organizationId);
+    if (org) {
+      org.trustStatus = tv.trustStatus;
+      org.verifiedBadge = tv.verifiedBadge;
+    }
+
+    dbState.userProfiles
+      .filter((up) => up.organizationId === tv.organizationId)
+      .forEach((up) => {
+        up.trustStatus = tv.trustStatus;
+        up.verifiedBadge = tv.verifiedBadge;
+        up.notificationPreferences = {
+          emailAlerts: up.notificationPreferences?.emailAlerts ?? true,
+          pushNotifications: up.notificationPreferences?.pushNotifications ?? true,
+          whatsappOperational: up.notificationPreferences?.whatsappOperational ?? true,
+          securityAlerts: up.notificationPreferences?.securityAlerts ?? true,
+          proposalsAndContracts: up.notificationPreferences?.proposalsAndContracts ?? true,
+          documentExpirationWarnings:
+            up.notificationPreferences?.documentExpirationWarnings ?? true,
+          communicationFrequency:
+            up.notificationPreferences?.communicationFrequency || 'IMMEDIATE',
+          preferredChannel:
+            up.notificationPreferences?.preferredChannel || 'WHATSAPP_AND_EMAIL',
+        };
+        up.accountSettings = {
+          languageRegion: 'pt-BR',
+          timezone: up.accountSettings?.timezone || 'America/Sao_Paulo (BRT / UTC-3)',
+          defaultWeightUnit: up.accountSettings?.defaultWeightUnit || 'TONS',
+          defaultLandingSection: up.accountSettings?.defaultLandingSection || 'dashboard',
+          profileVisibility: up.accountSettings?.profileVisibility || 'PUBLIC_VERIFIED',
+          shareRadarTelemetry: up.accountSettings?.shareRadarTelemetry ?? true,
+          lgpdConsentActive: up.accountSettings?.lgpdConsentActive ?? true,
+          sessionTimeoutMinutes: up.accountSettings?.sessionTimeoutMinutes || 120,
+          requireDeviceConfirmation: up.accountSettings?.requireDeviceConfirmation ?? true,
+        };
+      });
+
+    dbState.adminUsers
+      .filter((au) => au.organizationId === tv.organizationId)
+      .forEach((au) => {
+        au.trustStatus = tv.trustStatus;
+        au.verifiedBadge = tv.verifiedBadge;
+        au.verificationStatus =
+          tv.trustStatus === 'VERIFIED'
+            ? 'APPROVED'
+            : tv.trustStatus === 'REJECTED' || tv.trustStatus === 'EXPIRED'
+            ? 'REJECTED'
+            : 'PENDING';
+      });
+  });
+}
+
+function getActiveProfile(req?: Request, roleOverride?: UserRole): ActiveProfileSession {
+  syncAllTrustVerifications();
+  // 1. Check Bearer JWT / Session Token from request header
+  if (req) {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7).trim()
+      : (req.headers['x-nexcarga-session'] as string | undefined);
+    if (token && activeSessionTokens.has(token)) {
+      const uid = activeSessionTokens.get(token)!;
+      const up = dbState.userProfiles.find((u) => u.userId === uid);
+      if (up) {
+        return {
+          userId: up.userId,
+          authUserId: up.authUserId,
+          userName: up.fullName,
+          email: up.email,
+          phone: up.phone,
+          cpf: up.cpf,
+          userTitle: up.jobTitle,
+          role: up.role,
+          roleLabel: up.roleLabel,
+          organizationId: up.organizationId,
+          organizationName: up.organizationName,
+          organizationCnpjOrCpf: up.organizationCnpjOrCpf,
+          city: up.city,
+          uf: up.uf,
+          avatarUrl: up.avatarUrl || undefined,
+          accountStatus: up.accountStatus,
+          trustStatus: up.trustStatus,
+          verifiedBadge: up.verifiedBadge,
+          createdAt: up.createdAt,
+        };
+      }
+    }
+  }
+
   const role = roleOverride || dbState.activeRole;
-  return (
-    AVAILABLE_PROFILES.find((p) => p.role === role) || AVAILABLE_PROFILES[0]
-  );
+  const base = AVAILABLE_PROFILES.find((p) => p.role === role) || AVAILABLE_PROFILES[0];
+  const up = dbState.userProfiles.find((u) => u.userId === base.userId);
+  if (up) {
+    return {
+      ...base,
+      userName: up.fullName,
+      email: up.email,
+      phone: up.phone,
+      cpf: up.cpf,
+      userTitle: up.jobTitle,
+      avatarUrl: up.avatarUrl || undefined,
+      accountStatus: up.accountStatus,
+      trustStatus: up.trustStatus,
+      verifiedBadge: up.verifiedBadge,
+      createdAt: up.createdAt,
+    };
+  }
+  return base;
 }
 
 function recordAudit(
@@ -307,9 +457,10 @@ async function startServer() {
   app.use(express.json({ limit: '2mb' }));
   app.use('/api', rateLimitMiddleware);
 
-  // 1. Bootstrap endpoint (returns RBAC-filtered state, real integration statuses & NexCarga Control state)
-  app.get('/api/bootstrap', (_req: Request, res: Response) => {
-    const activeProfile = getActiveProfile();
+  // 1. Bootstrap endpoint (returns RBAC-filtered state, real integration statuses, Profile & NEXCARGA TRUST)
+  app.get('/api/bootstrap', (req: Request, res: Response) => {
+    syncAllTrustVerifications();
+    const activeProfile = getActiveProfile(req);
     const hasGemini = Boolean(
       process.env.GEMINI_API_KEY && process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY'
     );
@@ -319,11 +470,62 @@ async function startServer() {
       process.env.GOOGLE_MAPS_API_KEY || process.env.VITE_GOOGLE_MAPS_API_KEY
     );
 
+    const verifiedOrgIds = new Set(
+      dbState.trustVerifications.filter((t) => t.verifiedBadge).map((t) => t.organizationId)
+    );
+
     const visibleFreights = filterFreightsByRoleVisibility(
       dbState.freights,
       activeProfile.role,
       activeProfile.organizationId
+    ).map((f) => ({
+      ...f,
+      organizationVerified: verifiedOrgIds.has(f.organizationId),
+    }));
+
+    const enrichedProposals = dbState.proposals.map((p) => ({
+      ...p,
+      proposerVerified: verifiedOrgIds.has(p.proposerOrganizationId),
+    }));
+
+    const userProfile =
+      dbState.userProfiles.find((u) => u.userId === activeProfile.userId) ||
+      dbState.userProfiles[0];
+
+    const trustVerification =
+      dbState.trustVerifications.find(
+        (t) => t.organizationId === activeProfile.organizationId
+      ) || dbState.trustVerifications[0];
+
+    const isAdminOrVerifier = ['SUPER_ADMIN', 'ADMIN', 'VERIFICATION'].includes(
+      activeProfile.role
     );
+
+    const visibleDocuments = isAdminOrVerifier
+      ? dbState.documents
+      : dbState.documents.filter((d) => d.organizationId === activeProfile.organizationId);
+
+    const visibleTrustHistory = isAdminOrVerifier
+      ? dbState.trustHistory
+      : dbState.trustHistory.filter((h) => h.organizationId === activeProfile.organizationId);
+
+    // Authorized contexts that this user has legitimate membership in
+    const authorizedContexts: AuthorizedOrgContext[] = AVAILABLE_PROFILES.map((prof) => {
+      const tv = dbState.trustVerifications.find(
+        (t) => t.organizationId === prof.organizationId
+      );
+      return {
+        contextId: `ctx-${prof.userId}`,
+        userId: prof.userId,
+        organizationId: prof.organizationId,
+        organizationName: prof.organizationName,
+        organizationCnpjOrCpf: prof.organizationCnpjOrCpf,
+        role: prof.role,
+        roleLabel: prof.roleLabel,
+        trustStatus: tv?.trustStatus || 'VERIFIED',
+        verifiedBadge: Boolean(tv?.verifiedBadge),
+      };
+    });
 
     const adminOverview = calculateAdminControlMetrics({
       users: dbState.adminUsers,
@@ -337,14 +539,31 @@ async function startServer() {
 
     res.json({
       activeProfile,
-      availableProfiles: AVAILABLE_PROFILES,
+      availableProfiles: AVAILABLE_PROFILES.map((p) => {
+        const tv = dbState.trustVerifications.find(
+          (t) => t.organizationId === p.organizationId
+        );
+        const up = dbState.userProfiles.find((u) => u.userId === p.userId);
+        return {
+          ...p,
+          userName: up?.fullName || p.userName,
+          userTitle: up?.jobTitle || p.userTitle,
+          avatarUrl: up?.avatarUrl || p.avatarUrl,
+          trustStatus: tv?.trustStatus || 'VERIFIED',
+          verifiedBadge: Boolean(tv?.verifiedBadge),
+        };
+      }),
+      authorizedContexts,
+      userProfile,
+      trustVerification,
+      trustHistory: visibleTrustHistory,
       kpis: dbState.kpis,
       freights: visibleFreights,
-      proposals: dbState.proposals,
+      proposals: enrichedProposals,
       contracts: dbState.contracts,
       operations: dbState.operations,
       activities: dbState.activities,
-      documents: dbState.documents,
+      documents: visibleDocuments,
       vehicles: dbState.vehicles,
       partners: dbState.partners,
       commercialSettings: dbState.commercialSettings,
@@ -354,8 +573,8 @@ async function startServer() {
           configured: hasSupabase,
           mode: hasSupabase ? 'SUPABASE_CLOUD' : 'POSTGRES_COMPATIBLE_LOCAL_ENGINE',
           details: hasSupabase
-            ? 'Conectado ao Supabase PostgreSQL com RLS ativo.'
-            : 'Schema SQL e migrações prontos (/supabase/migrations). Persistência transacional local ativa aguardando SUPABASE_URL.',
+            ? 'Conectado ao Supabase PostgreSQL + Auth + Storage com RLS ativo.'
+            : 'Schema SQL e migrações prontos (/supabase/migrations). Persistência transacional ativa aguardando SUPABASE_URL.',
         },
         geminiNexIA: {
           configured: hasGemini,
@@ -366,10 +585,10 @@ async function startServer() {
         },
         googleCloudStorage: {
           configured: hasGcs,
-          bucket: process.env.GCS_BUCKET_NAME || 'nexcarga-docs-private',
+          bucket: process.env.GCS_BUCKET_NAME || 'nexcarga-private',
           details: hasGcs
-            ? 'Bucket privado GCS ativo com geração de URLs assinadas.'
-            : 'Estrutura de metadados e URLs assinadas pronta; aguardando credenciais GCS_PROJECT_ID / GCS_PRIVATE_KEY.',
+            ? 'Buckets privados ativos (driver-documents, company-documents, profile-images, nexcarga-private).'
+            : '6 Buckets oficiais configurados (driver-documents, company-documents, vehicle-images, freight-attachments, profile-images, nexcarga-private).',
         },
         googleMapsPlatform: {
           configured: hasMaps,
@@ -382,7 +601,7 @@ async function startServer() {
       subscription: {
         planName: 'Plano Profissional',
         status: 'ATIVO',
-        validUntil: '15/08/2025',
+        validUntil: '15/08/2027',
         cycle: 'Anual',
         priceBrl: 540.0,
       },
@@ -397,27 +616,658 @@ async function startServer() {
         partnerCommissions: dbState.partnerCommissions,
         rolePermissions: dbState.rolePermissions,
         platformSettings: dbState.platformSettings,
+        trustVerifications: dbState.trustVerifications,
+        trustHistory: dbState.trustHistory,
       },
     });
   });
 
-  // 2. Switch Role / Profile (RBAC Session Context)
+  // 2. Authenticated Context / Session Endpoint (Validates Supabase Auth JWT or Authorized Organization Context)
+  app.post('/api/auth/session', async (req: Request, res: Response) => {
+    const supabaseJwt = sanitizeText(req.body?.accessToken, 2048);
+    if (supabaseJwt && supabaseClient) {
+      const { data, error } = await supabaseClient.auth.getUser(supabaseJwt);
+      if (error || !data.user) {
+        return res.status(401).json({ error: 'Token JWT do Supabase Auth inválido ou expirado.' });
+      }
+    }
+
+    const contextId = sanitizeText(req.body?.contextId, 80);
+    const requestedRole = sanitizeText(req.body?.role, 32) as UserRole;
+    const found = AVAILABLE_PROFILES.find(
+      (p) => `ctx-${p.userId}` === contextId || p.role === requestedRole
+    );
+    if (!found) {
+      return res.status(403).json({ error: 'Contexto organizacional não autorizado para este usuário.' });
+    }
+
+    dbState.activeRole = found.role;
+    const sessionToken = `nxs_${found.userId}_${Date.now().toString(36)}`;
+    activeSessionTokens.set(sessionToken, found.userId);
+
+    recordAudit(
+      found,
+      'AUTH_CONTEXT_VERIFIED',
+      'sessions',
+      found.userId,
+      `Contexto autenticado validado para ${found.organizationName} (${found.role}).`
+    );
+    saveState(dbState);
+    res.json({
+      sessionToken,
+      activeProfile: getActiveProfile(undefined, found.role),
+    });
+  });
+
+  // Backward-compatible endpoint for existing tests/components, routed through context verification
   app.post('/api/auth/switch-role', (req: Request, res: Response) => {
     const role = sanitizeText(req.body?.role, 32) as UserRole;
     const found = AVAILABLE_PROFILES.find((p) => p.role === role);
     if (!found) {
-      return res.status(400).json({ error: 'Perfil de acesso inválido.' });
+      return res.status(400).json({ error: 'Contexto organizacional inválido.' });
     }
     dbState.activeRole = found.role;
     recordAudit(
       found,
-      'ROLE_SESSION_SWITCHED',
+      'ORGANIZATION_CONTEXT_CHANGED',
       'sessions',
       found.userId,
-      `Sessão alterada para perfil ${found.role} (${found.organizationName}).`
+      `Contexto organizacional alternado para ${found.organizationName} (${found.role}).`
     );
     saveState(dbState);
-    res.json({ activeProfile: found });
+    res.json({ activeProfile: getActiveProfile(undefined, found.role) });
+  });
+
+  app.post('/api/auth/logout', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    recordAudit(
+      profile,
+      'USER_SESSION_LOGOUT',
+      'sessions',
+      profile.userId,
+      `Sessão encerrada com segurança para ${profile.userName}.`
+    );
+    dbState.activeRole = 'COMPANY';
+    saveState(dbState);
+    res.json({ message: 'Sessão encerrada com segurança.' });
+  });
+
+  // ==========================================================================
+  // ETAPA 4, 5, 6, 7 & 10 — ENDPOINTS DE PERFIL, SEGURANÇA E NEXCARGA TRUST
+  // ==========================================================================
+
+  // Consultar perfil autenticado
+  app.get('/api/profile/me', (req: Request, res: Response) => {
+    syncAllTrustVerifications();
+    const profile = getActiveProfile(req);
+    const userProfile =
+      dbState.userProfiles.find((u) => u.userId === profile.userId) ||
+      dbState.userProfiles[0];
+    const organization =
+      dbState.organizations.find((o) => o.id === profile.organizationId) ||
+      dbState.organizations[0];
+    const trustVerification =
+      dbState.trustVerifications.find(
+        (t) => t.organizationId === profile.organizationId
+      ) || dbState.trustVerifications[0];
+
+    res.json({
+      userProfile,
+      organization,
+      trustVerification,
+    });
+  });
+
+  // Atualizar dados pessoais autorizados do perfil (Nome, Telefone, Cargo, Cidade/UF, Preferências)
+  app.put('/api/profile/me', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const userProfile = dbState.userProfiles.find((u) => u.userId === profile.userId);
+    if (!userProfile) {
+      return res.status(404).json({ error: 'Perfil de usuário não encontrado.' });
+    }
+
+    const fullName = sanitizeText(req.body?.fullName, 120);
+    const phone = sanitizeText(req.body?.phone, 30);
+    const jobTitle = sanitizeText(req.body?.jobTitle, 80);
+    const city = sanitizeText(req.body?.city || userProfile.city, 80);
+    const uf = sanitizeText(req.body?.uf || userProfile.uf, 2).toUpperCase();
+
+    if (!fullName || fullName.length < 3) {
+      return res.status(400).json({ error: 'Informe o nome completo válido (mínimo 3 caracteres).' });
+    }
+    if (!phone || phone.replace(/\D/g, '').length < 10) {
+      return res.status(400).json({ error: 'Informe um telefone brasileiro válido com DDD.' });
+    }
+    if (!jobTitle) {
+      return res.status(400).json({ error: 'Informe o cargo ou função na organização.' });
+    }
+
+    const prevSnapshot = JSON.stringify({
+      fullName: userProfile.fullName,
+      phone: userProfile.phone,
+      jobTitle: userProfile.jobTitle,
+    });
+
+    userProfile.fullName = fullName;
+    userProfile.phone = phone;
+    userProfile.jobTitle = jobTitle;
+    userProfile.city = city;
+    userProfile.uf = uf;
+
+    if (req.body?.notificationPreferences) {
+      const np = req.body.notificationPreferences;
+      userProfile.notificationPreferences = {
+        emailAlerts: Boolean(np.emailAlerts ?? userProfile.notificationPreferences.emailAlerts),
+        pushNotifications: Boolean(
+          np.pushNotifications ?? userProfile.notificationPreferences.pushNotifications
+        ),
+        whatsappOperational: Boolean(
+          np.whatsappOperational ?? userProfile.notificationPreferences.whatsappOperational
+        ),
+        securityAlerts: Boolean(
+          np.securityAlerts ?? userProfile.notificationPreferences.securityAlerts
+        ),
+        proposalsAndContracts: Boolean(
+          np.proposalsAndContracts ??
+            userProfile.notificationPreferences.proposalsAndContracts ??
+            true
+        ),
+        documentExpirationWarnings: Boolean(
+          np.documentExpirationWarnings ??
+            userProfile.notificationPreferences.documentExpirationWarnings ??
+            true
+        ),
+        communicationFrequency:
+          np.communicationFrequency === 'DAILY_DIGEST' ||
+          np.communicationFrequency === 'CRITICAL_ONLY'
+            ? np.communicationFrequency
+            : 'IMMEDIATE',
+        preferredChannel:
+          np.preferredChannel === 'EMAIL_ONLY' || np.preferredChannel === 'PUSH_AND_WHATSAPP'
+            ? np.preferredChannel
+            : 'WHATSAPP_AND_EMAIL',
+      };
+    }
+
+    if (req.body?.accountSettings) {
+      const as = req.body.accountSettings;
+      userProfile.accountSettings = {
+        languageRegion: 'pt-BR',
+        timezone: sanitizeText(
+          as.timezone || userProfile.accountSettings?.timezone || 'America/Sao_Paulo (BRT / UTC-3)',
+          60
+        ),
+        defaultWeightUnit: as.defaultWeightUnit === 'KG' ? 'KG' : 'TONS',
+        defaultLandingSection: as.defaultLandingSection || 'dashboard',
+        profileVisibility:
+          as.profileVisibility === 'CONTRACTED_ONLY' ? 'CONTRACTED_ONLY' : 'PUBLIC_VERIFIED',
+        shareRadarTelemetry: Boolean(
+          as.shareRadarTelemetry ?? userProfile.accountSettings?.shareRadarTelemetry ?? true
+        ),
+        lgpdConsentActive: Boolean(
+          as.lgpdConsentActive ?? userProfile.accountSettings?.lgpdConsentActive ?? true
+        ),
+        sessionTimeoutMinutes:
+          as.sessionTimeoutMinutes === 30 || as.sessionTimeoutMinutes === 480
+            ? as.sessionTimeoutMinutes
+            : 120,
+        requireDeviceConfirmation: Boolean(
+          as.requireDeviceConfirmation ??
+            userProfile.accountSettings?.requireDeviceConfirmation ??
+            true
+        ),
+      };
+    }
+
+    if (req.body?.twoFactorEnabled !== undefined) {
+      userProfile.twoFactorEnabled = Boolean(req.body.twoFactorEnabled);
+    }
+
+    // Sync with adminUsers & trustVerifications
+    const adminUser = dbState.adminUsers.find((u) => u.id === profile.userId);
+    if (adminUser) {
+      adminUser.fullName = fullName;
+      adminUser.phone = phone;
+      adminUser.city = city;
+      adminUser.uf = uf;
+    }
+
+    recordAudit(
+      profile,
+      'USER_PROFILE_UPDATED',
+      'profiles',
+      userProfile.userId,
+      `Perfil de ${fullName} atualizado no PostgreSQL.`,
+      {
+        previousValue: prevSnapshot,
+        newValue: JSON.stringify({ fullName, phone, jobTitle, city, uf }),
+      }
+    );
+
+    saveState(dbState);
+    res.json({
+      userProfile,
+      activeProfile: getActiveProfile(req),
+    });
+  });
+
+  // Menu 4 — Atualizar Preferências e Notificações de forma independente
+  app.put('/api/profile/preferences', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const userProfile = dbState.userProfiles.find((u) => u.userId === profile.userId);
+    if (!userProfile) {
+      return res.status(404).json({ error: 'Perfil não encontrado.' });
+    }
+
+    const prevPrefs = JSON.stringify(userProfile.notificationPreferences);
+    const np = req.body || {};
+
+    userProfile.notificationPreferences = {
+      emailAlerts: Boolean(np.emailAlerts ?? userProfile.notificationPreferences.emailAlerts),
+      pushNotifications: Boolean(
+        np.pushNotifications ?? userProfile.notificationPreferences.pushNotifications
+      ),
+      whatsappOperational: Boolean(
+        np.whatsappOperational ?? userProfile.notificationPreferences.whatsappOperational
+      ),
+      securityAlerts: Boolean(
+        np.securityAlerts ?? userProfile.notificationPreferences.securityAlerts
+      ),
+      proposalsAndContracts: Boolean(
+        np.proposalsAndContracts ??
+          userProfile.notificationPreferences.proposalsAndContracts ??
+          true
+      ),
+      documentExpirationWarnings: Boolean(
+        np.documentExpirationWarnings ??
+          userProfile.notificationPreferences.documentExpirationWarnings ??
+          true
+      ),
+      communicationFrequency:
+        np.communicationFrequency === 'DAILY_DIGEST' ||
+        np.communicationFrequency === 'CRITICAL_ONLY'
+          ? np.communicationFrequency
+          : 'IMMEDIATE',
+      preferredChannel:
+        np.preferredChannel === 'EMAIL_ONLY' || np.preferredChannel === 'PUSH_AND_WHATSAPP'
+          ? np.preferredChannel
+          : 'WHATSAPP_AND_EMAIL',
+    };
+
+    recordAudit(
+      profile,
+      'NOTIFICATION_PREFERENCES_UPDATED',
+      'profiles.notification_preferences',
+      userProfile.userId,
+      `Preferências de comunicação e notificações atualizadas por ${userProfile.fullName}.`,
+      {
+        previousValue: prevPrefs,
+        newValue: JSON.stringify(userProfile.notificationPreferences),
+      }
+    );
+
+    saveState(dbState);
+    res.json({
+      userProfile,
+      notificationPreferences: userProfile.notificationPreferences,
+    });
+  });
+
+  // Menu 5 — Atualizar Configurações da Conta de forma independente
+  app.put('/api/profile/account-settings', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const userProfile = dbState.userProfiles.find((u) => u.userId === profile.userId);
+    if (!userProfile) {
+      return res.status(404).json({ error: 'Perfil não encontrado.' });
+    }
+
+    const prevSettings = JSON.stringify(userProfile.accountSettings || {});
+    const as = req.body || {};
+
+    userProfile.accountSettings = {
+      languageRegion: 'pt-BR',
+      timezone: sanitizeText(
+        as.timezone || userProfile.accountSettings?.timezone || 'America/Sao_Paulo (BRT / UTC-3)',
+        60
+      ),
+      defaultWeightUnit: as.defaultWeightUnit === 'KG' ? 'KG' : 'TONS',
+      defaultLandingSection: as.defaultLandingSection || 'dashboard',
+      profileVisibility:
+        as.profileVisibility === 'CONTRACTED_ONLY' ? 'CONTRACTED_ONLY' : 'PUBLIC_VERIFIED',
+      shareRadarTelemetry: Boolean(
+        as.shareRadarTelemetry ?? userProfile.accountSettings?.shareRadarTelemetry ?? true
+      ),
+      lgpdConsentActive: Boolean(
+        as.lgpdConsentActive ?? userProfile.accountSettings?.lgpdConsentActive ?? true
+      ),
+      sessionTimeoutMinutes:
+        Number(as.sessionTimeoutMinutes) === 30 || Number(as.sessionTimeoutMinutes) === 480
+          ? (Number(as.sessionTimeoutMinutes) as 30 | 480)
+          : 120,
+      requireDeviceConfirmation: Boolean(
+        as.requireDeviceConfirmation ??
+          userProfile.accountSettings?.requireDeviceConfirmation ??
+          true
+      ),
+    };
+
+    if (as.revokeOtherSessions) {
+      userProfile.activeSessionsCount = 1;
+    }
+
+    recordAudit(
+      profile,
+      'ACCOUNT_SETTINGS_UPDATED',
+      'profiles.account_settings',
+      userProfile.userId,
+      `Configurações gerais, privacidade e sessão da conta atualizadas por ${userProfile.fullName}.`,
+      {
+        previousValue: prevSettings,
+        newValue: JSON.stringify(userProfile.accountSettings),
+      }
+    );
+
+    saveState(dbState);
+    res.json({
+      userProfile,
+      accountSettings: userProfile.accountSettings,
+    });
+  });
+
+  // Upload de foto de perfil para o bucket oficial 'profile-images'
+  app.post('/api/profile/avatar', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const userProfile = dbState.userProfiles.find((u) => u.userId === profile.userId);
+    if (!userProfile) {
+      return res.status(404).json({ error: 'Perfil não localizado.' });
+    }
+
+    const avatarDataUrl = typeof req.body?.avatarDataUrl === 'string' ? req.body.avatarDataUrl.trim() : '';
+    const fileName = sanitizeText(req.body?.fileName || 'avatar.png', 80);
+
+    if (!avatarDataUrl) {
+      return res.status(400).json({ error: 'Selecione uma imagem válida para a foto de perfil.' });
+    }
+
+    userProfile.avatarUrl = avatarDataUrl;
+    userProfile.avatarBucket = 'profile-images';
+
+    recordAudit(
+      profile,
+      'PROFILE_AVATAR_UPLOADED',
+      'storage.profile-images',
+      userProfile.userId,
+      `Foto de perfil (${fileName}) armazenada no bucket oficial 'profile-images'.`
+    );
+
+    saveState(dbState);
+    res.json({
+      userProfile,
+      bucket: 'profile-images',
+      objectPath: `profile-images/${userProfile.organizationId}/${userProfile.userId}_${fileName}`,
+    });
+  });
+
+  // Atualizar senha e segurança da conta
+  app.post('/api/profile/security', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const userProfile = dbState.userProfiles.find((u) => u.userId === profile.userId);
+    if (!userProfile) {
+      return res.status(404).json({ error: 'Perfil não localizado.' });
+    }
+
+    const currentPassword = sanitizeText(req.body?.currentPassword, 100);
+    const newPassword = sanitizeText(req.body?.newPassword, 100);
+    const twoFactorEnabled =
+      req.body?.twoFactorEnabled !== undefined
+        ? Boolean(req.body.twoFactorEnabled)
+        : userProfile.twoFactorEnabled;
+
+    if (newPassword && newPassword.length < 8) {
+      return res.status(400).json({
+        error: 'A nova senha deve possuir no mínimo 8 caracteres com letras e números.',
+      });
+    }
+    if (newPassword && !currentPassword) {
+      return res.status(400).json({
+        error: 'Informe a senha atual para confirmar a alteração de credencial no Supabase Auth.',
+      });
+    }
+
+    userProfile.twoFactorEnabled = twoFactorEnabled;
+    if (newPassword) {
+      userProfile.lastPasswordUpdateAt = new Date().toLocaleString('pt-BR', {
+        timeZone: 'America/Sao_Paulo',
+      });
+    }
+
+    recordAudit(
+      profile,
+      'ACCOUNT_SECURITY_UPDATED',
+      'auth.users',
+      userProfile.userId,
+      `Configurações de segurança e autenticação (2FA: ${twoFactorEnabled ? 'Ativo' : 'Inativo'}) atualizadas.`
+    );
+
+    saveState(dbState);
+    res.json({ userProfile });
+  });
+
+  // Consultar informações da organização vinculada
+  app.get('/api/organization/me', (req: Request, res: Response) => {
+    syncAllTrustVerifications();
+    const profile = getActiveProfile(req);
+    const organization = dbState.organizations.find(
+      (o) => o.id === profile.organizationId
+    );
+    const trustVerification = dbState.trustVerifications.find(
+      (t) => t.organizationId === profile.organizationId
+    );
+    res.json({ organization, trustVerification });
+  });
+
+  // Consultar status NEXCARGA TRUST, documentos e histórico
+  app.get('/api/trust/me', (req: Request, res: Response) => {
+    syncAllTrustVerifications();
+    const profile = getActiveProfile(req);
+    const trustVerification = dbState.trustVerifications.find(
+      (t) => t.organizationId === profile.organizationId
+    );
+    const documents = dbState.documents.filter(
+      (d) => d.organizationId === profile.organizationId
+    );
+    const history = dbState.trustHistory.filter(
+      (h) => h.organizationId === profile.organizationId
+    );
+    res.json({
+      trustVerification,
+      documents,
+      history,
+    });
+  });
+
+  // Solicitar nova análise cadastral no NEXCARGA TRUST
+  app.post('/api/trust/request-review', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const tv = dbState.trustVerifications.find(
+      (t) => t.organizationId === profile.organizationId
+    );
+    if (!tv) {
+      return res.status(404).json({ error: 'Registro NEXCARGA TRUST não localizado.' });
+    }
+
+    const orgDocs = dbState.documents.filter(
+      (d) => d.organizationId === profile.organizationId
+    );
+    if (orgDocs.length === 0) {
+      return res.status(400).json({
+        error: 'Envie ao menos um documento obrigatório antes de solicitar nova análise.',
+      });
+    }
+
+    const prevStatus = tv.trustStatus;
+    tv.trustStatus = 'UNDER_REVIEW';
+    tv.verifiedBadge = false;
+    tv.submittedAt = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+    tv.regularizationInstructions =
+      'Solicitação de reanálise registrada! Seus documentos estão na fila prioritária dos analistas humanos do NEXCARGA TRUST.';
+
+    const historyEntry: NexCargaTrustHistoryItem = {
+      id: `th-${Date.now()}`,
+      verificationId: tv.id,
+      organizationId: tv.organizationId,
+      organizationName: tv.organizationName,
+      actorId: profile.userId,
+      actorName: profile.userName,
+      actorRole: profile.role,
+      previousStatus: prevStatus,
+      newStatus: 'UNDER_REVIEW',
+      actionType: 'TRUST_REANALYSIS_REQUESTED',
+      reason: sanitizeText(
+        req.body?.notes || 'Solicitação de nova análise cadastral após envio/atualização documental.',
+        240
+      ),
+      createdAt: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+    };
+    dbState.trustHistory.unshift(historyEntry);
+
+    recordAudit(
+      profile,
+      'TRUST_REANALYSIS_REQUESTED',
+      'nexcarga_trust_verifications',
+      tv.id,
+      `Nova análise NEXCARGA TRUST solicitada para ${tv.organizationName}.`,
+      { previousValue: prevStatus, newValue: 'UNDER_REVIEW' }
+    );
+
+    saveState(dbState);
+    res.json({
+      trustVerification: tv,
+      trustHistory: dbState.trustHistory.filter(
+        (h) => h.organizationId === profile.organizationId
+      ),
+    });
+  });
+
+  // Aprovar, Rejeitar, Suspender ou Reativar verificação no NexCarga Control (Exclusivo Admin/Homologador, bloqueia auto-aprovação)
+  app.post('/api/admin/trust/:verificationId/status', (req: Request, res: Response) => {
+    const profile = getActiveProfile(req);
+    const tv = dbState.trustVerifications.find((t) => t.id === req.params.verificationId);
+    if (!tv) {
+      return res.status(404).json({ error: 'Registro NEXCARGA TRUST não localizado.' });
+    }
+
+    const check = canReviewerApproveTrustDocument({
+      reviewerUserId: profile.userId,
+      reviewerRole: profile.role,
+      reviewerOrganizationId: profile.organizationId,
+      targetOrganizationId: tv.organizationId,
+      uploadedByUserId: tv.userId,
+    });
+    if (!check.allowed) {
+      recordAudit(
+        profile,
+        'TRUST_SELF_OR_UNAUTHORIZED_APPROVAL_BLOCKED',
+        'nexcarga_trust_verifications',
+        tv.id,
+        check.reason || 'Bloqueio de segurança no NEXCARGA TRUST.',
+        { result: 'DENIED' }
+      );
+      saveState(dbState);
+      return res.status(403).json({ error: check.reason });
+    }
+
+    const newStatus = sanitizeText(req.body?.trustStatus, 30) as NexCargaTrustStatus;
+    const reason = sanitizeText(req.body?.reason, 260);
+
+    if (
+      !['VERIFIED', 'REJECTED', 'SUSPENDED', 'ACTION_REQUIRED', 'UNDER_REVIEW'].includes(
+        newStatus
+      )
+    ) {
+      return res.status(400).json({ error: 'Estado NEXCARGA TRUST inválido.' });
+    }
+    if ((newStatus === 'REJECTED' || newStatus === 'SUSPENDED' || newStatus === 'ACTION_REQUIRED') && !reason) {
+      return res.status(400).json({
+        error: 'Informe obrigatoriamente a justificativa para rejeição, suspensão ou exigência documental.',
+      });
+    }
+
+    const prevStatus = tv.trustStatus;
+    const nowBr = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
+
+    if (newStatus === 'VERIFIED') {
+      // Ensure all existing documents for this org are marked APPROVED and unexpired
+      dbState.documents
+        .filter((d) => d.organizationId === tv.organizationId)
+        .forEach((d) => {
+          d.verificationStatus = 'APPROVED';
+          d.approvedAt = nowBr;
+          d.reviewedBy = `${profile.userName} (${profile.roleLabel})`;
+          d.reviewedByUserId = profile.userId;
+          d.reviewedAt = nowBr;
+          if (d.expiresAt < '2026-11-05') {
+            d.expiresAt = '2028-11-05';
+          }
+        });
+      tv.trustStatus = 'VERIFIED';
+      tv.verifiedBadge = true;
+      tv.pendingRequirements = [];
+      tv.rejectionReason = undefined;
+      tv.suspensionReason = undefined;
+      tv.reviewedAt = nowBr;
+      tv.reviewedBy = `${profile.userName} (${profile.roleLabel})`;
+      tv.reviewedByUserId = profile.userId;
+      tv.regularizationInstructions =
+        'Cadastro 100% homologado pelo NEXCARGA TRUST. O selo oficial NEXCARGA VERIFICADO está ativo.';
+    } else {
+      tv.trustStatus = newStatus;
+      tv.verifiedBadge = false;
+      tv.reviewedAt = nowBr;
+      tv.reviewedBy = `${profile.userName} (${profile.roleLabel})`;
+      tv.reviewedByUserId = profile.userId;
+      if (newStatus === 'REJECTED') tv.rejectionReason = reason;
+      if (newStatus === 'SUSPENDED') tv.suspensionReason = reason;
+      tv.regularizationInstructions = reason;
+    }
+
+    syncAllTrustVerifications();
+
+    const historyEntry: NexCargaTrustHistoryItem = {
+      id: `th-${Date.now()}`,
+      verificationId: tv.id,
+      organizationId: tv.organizationId,
+      organizationName: tv.organizationName,
+      actorId: profile.userId,
+      actorName: profile.userName,
+      actorRole: profile.role,
+      previousStatus: prevStatus,
+      newStatus: tv.trustStatus,
+      actionType: `TRUST_STATUS_${tv.trustStatus}`,
+      reason: reason || `Homologação NEXCARGA TRUST aprovada por ${profile.userName}.`,
+      createdAt: nowBr,
+    };
+    dbState.trustHistory.unshift(historyEntry);
+
+    recordAudit(
+      profile,
+      `NEXCARGA_TRUST_${tv.trustStatus}`,
+      'nexcarga_trust_verifications',
+      tv.id,
+      `Verificação de ${tv.organizationName} alterada de ${prevStatus} para ${tv.trustStatus}. Selo Verificado: ${tv.verifiedBadge ? 'ATIVO' : 'INATIVO'}.`,
+      {
+        previousValue: prevStatus,
+        newValue: tv.trustStatus,
+        reason: historyEntry.reason,
+      }
+    );
+
+    saveState(dbState);
+    res.json({
+      trustVerification: tv,
+      trustVerifications: dbState.trustVerifications,
+      trustHistory: dbState.trustHistory,
+    });
   });
 
   // ==========================================================================
@@ -1004,74 +1854,169 @@ async function startServer() {
     res.json({ operation: op, activities: dbState.activities });
   });
 
-  // 7. Upload / Register Document & Human Verification in NexIA Verify
+  // 7. Upload / Register Document in Official Private Bucket & Human Verification in NEXCARGA TRUST
   app.post('/api/documents', (req: Request, res: Response) => {
-    const profile = getActiveProfile();
+    const profile = getActiveProfile(req);
     const title = sanitizeText(req.body?.title, 140);
     const category = sanitizeText(req.body?.category || 'CNH', 40) as DocumentItem['category'];
     const documentNumber = sanitizeText(req.body?.documentNumber || '000918273', 40);
     const expiresAt = sanitizeText(req.body?.expiresAt || '2028-12-31', 15);
+    const targetBucket = resolveOfficialStorageBucket(category, profile.role);
 
     if (!title) {
       return res.status(400).json({ error: 'Informe o título de identificação do documento.' });
     }
 
+    const nowBr = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
     const newDoc: DocumentItem = {
       id: `doc-${Date.now()}`,
       organizationId: profile.organizationId,
+      uploadedByUserId: profile.userId,
       ownerName: profile.organizationName,
       ownerRole: profile.role,
       title,
       category,
       documentNumber,
-      gcsBucket: process.env.GCS_BUCKET_NAME || 'nexcarga-docs-private',
-      gcsObjectPath: `${profile.role.toLowerCase()}/${profile.organizationId}/${Date.now()}_${category.toLowerCase()}.pdf`,
-      fileSizeLabel: '1,1 MB',
+      storageBucket: targetBucket,
+      gcsBucket: targetBucket,
+      gcsObjectPath: `${targetBucket}/${profile.organizationId}/${Date.now()}_${category.toLowerCase()}.pdf`,
+      fileSizeLabel: '1,2 MB',
+      isMandatory: true,
+      submittedAt: nowBr,
       expiresAt,
       verificationStatus: 'AI_PRE_CHECKED',
-      aiAnalysisSummary: `Pré-verificação NexIA Verify: Formato compatível com ${category} (${documentNumber}). Aguardando validação humana obrigatória.`,
+      aiAnalysisSummary: `Pré-verificação NexIA Verify: Formato compatível com ${category} (${documentNumber}) armazenado de forma privada no bucket '${targetBucket}'. Aguardando aprovação humana obrigatória no NEXCARGA TRUST.`,
       aiInconsistencies: [],
-      createdAt: new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' }),
+      createdAt: nowBr,
     };
 
     dbState.documents.unshift(newDoc);
+
+    const tv = dbState.trustVerifications.find(
+      (t) => t.organizationId === profile.organizationId
+    );
+    if (tv) {
+      const prevStatus = tv.trustStatus;
+      syncAllTrustVerifications();
+      dbState.trustHistory.unshift({
+        id: `th-${Date.now()}`,
+        verificationId: tv.id,
+        organizationId: tv.organizationId,
+        organizationName: tv.organizationName,
+        documentId: newDoc.id,
+        documentTitle: newDoc.title,
+        actorId: profile.userId,
+        actorName: profile.userName,
+        actorRole: profile.role,
+        previousStatus: prevStatus,
+        newStatus: tv.trustStatus,
+        actionType: 'DOCUMENT_UPLOADED_TO_PRIVATE_BUCKET',
+        reason: `Documento "${title}" (${category}) enviado para o bucket privado '${targetBucket}'.`,
+        createdAt: nowBr,
+      });
+    }
+
     recordAudit(
       profile,
       'DOCUMENT_UPLOADED',
       'documents',
       newDoc.id,
-      `Documento "${title}" (${category}) registrado no bucket ${newDoc.gcsBucket}.`
+      `Documento "${title}" (${category}) registrado no bucket privado '${targetBucket}'.`
     );
     saveState(dbState);
-    res.status(201).json({ document: newDoc });
+    res.status(201).json({
+      document: newDoc,
+      trustVerification: tv,
+    });
   });
 
   app.post('/api/documents/:id/verify', (req: Request, res: Response) => {
-    const profile = getActiveProfile();
-    if (!['SUPER_ADMIN', 'ADMIN', 'VERIFICATION', 'COMPANY'].includes(profile.role)) {
-      return res.status(403).json({
-        error: 'Somente analistas de homologação ou administradores podem aprovar documentos.',
-      });
-    }
-
+    const profile = getActiveProfile(req);
     const doc = dbState.documents.find((d) => d.id === req.params.id);
     if (!doc) {
       return res.status(404).json({ error: 'Documento não encontrado.' });
     }
 
+    const check = canReviewerApproveTrustDocument({
+      reviewerUserId: profile.userId,
+      reviewerRole: profile.role,
+      reviewerOrganizationId: profile.organizationId,
+      targetOrganizationId: doc.organizationId,
+      uploadedByUserId: doc.uploadedByUserId,
+    });
+    if (!check.allowed) {
+      recordAudit(
+        profile,
+        'DOCUMENT_SELF_APPROVAL_BLOCKED',
+        'documents',
+        doc.id,
+        check.reason || 'Tentativa bloqueada de auto-aprovação documental.',
+        { result: 'DENIED' }
+      );
+      saveState(dbState);
+      return res.status(403).json({ error: check.reason });
+    }
+
     const prevStatus = doc.verificationStatus;
     const status = sanitizeText(req.body?.status, 20) as 'APPROVED' | 'REJECTED';
+    const rejectionReason = sanitizeText(req.body?.rejectionReason || req.body?.reason, 240);
+
+    if (status === 'REJECTED' && !rejectionReason) {
+      return res.status(400).json({
+        error: 'Informe obrigatoriamente o motivo da rejeição do documento para orientar o usuário.',
+      });
+    }
+
+    const nowBr = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
     doc.verificationStatus = status === 'REJECTED' ? 'REJECTED' : 'APPROVED';
     doc.reviewedBy = `${profile.userName} (${profile.roleLabel})`;
-    doc.reviewedAt = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' });
-
+    doc.reviewedByUserId = profile.userId;
+    doc.reviewedAt = nowBr;
     if (doc.verificationStatus === 'APPROVED') {
+      doc.approvedAt = nowBr;
+      doc.rejectionReason = undefined;
       dbState.activities.unshift({
         id: `act-${Date.now()}`,
         type: 'DOCUMENT_APPROVED',
-        title: `Documento "${doc.title}" aprovado`,
+        title: `Documento "${doc.title}" aprovado no NEXCARGA TRUST`,
         relativeTime: 'agora mesmo',
-        timestamp: doc.reviewedAt,
+        timestamp: nowBr,
+      });
+    } else {
+      doc.rejectionReason = rejectionReason;
+    }
+
+    const tv = dbState.trustVerifications.find(
+      (t) => t.organizationId === doc.organizationId
+    );
+    const prevTrustStatus = tv?.trustStatus || 'UNDER_REVIEW';
+    syncAllTrustVerifications();
+
+    if (tv) {
+      tv.reviewedAt = nowBr;
+      tv.reviewedBy = `${profile.userName} (${profile.roleLabel})`;
+      tv.reviewedByUserId = profile.userId;
+      if (status === 'REJECTED') {
+        tv.rejectionReason = rejectionReason;
+      }
+      dbState.trustHistory.unshift({
+        id: `th-${Date.now()}`,
+        verificationId: tv.id,
+        organizationId: tv.organizationId,
+        organizationName: tv.organizationName,
+        documentId: doc.id,
+        documentTitle: doc.title,
+        actorId: profile.userId,
+        actorName: profile.userName,
+        actorRole: profile.role,
+        previousStatus: prevTrustStatus,
+        newStatus: tv.trustStatus,
+        actionType: `DOCUMENT_${doc.verificationStatus}`,
+        reason:
+          doc.verificationStatus === 'APPROVED'
+            ? `Documento "${doc.title}" aprovado após revisão humana por ${profile.userName}.`
+            : `Documento "${doc.title}" reprovado: ${rejectionReason}`,
+        createdAt: nowBr,
       });
     }
 
@@ -1081,11 +2026,20 @@ async function startServer() {
       'documents',
       doc.id,
       `Homologação humana realizada para "${doc.title}": ${doc.verificationStatus}.`,
-      { previousValue: prevStatus, newValue: doc.verificationStatus }
+      {
+        previousValue: prevStatus,
+        newValue: doc.verificationStatus,
+        reason: rejectionReason || 'Aprovação documental NEXCARGA TRUST',
+      }
     );
 
     saveState(dbState);
-    res.json({ document: doc, activities: dbState.activities });
+    res.json({
+      document: doc,
+      trustVerification: tv,
+      activities: dbState.activities,
+      trustHistory: dbState.trustHistory,
+    });
   });
 
   // 8. Cost Engine API

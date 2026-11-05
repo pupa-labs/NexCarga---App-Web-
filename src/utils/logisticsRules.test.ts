@@ -5,8 +5,10 @@ import {
   calculateDistanceKm,
   calculateLogisticsCost,
   calculatePlatformFees,
+  canReviewerApproveTrustDocument,
   canRoleAccessSection,
   createImmutableFeeSnapshot,
+  evaluateNexCargaTrustStatus,
   evaluateSubscriptionDelinquency,
   filterFreightsByRoleVisibility,
   filterNexgridFreights,
@@ -14,6 +16,7 @@ import {
   formatDateBr,
   geocodeBrazilianAddress,
   hasAdminPermission,
+  resolveOfficialStorageBucket,
   validateCep,
   validateCnpj,
   validateCpf,
@@ -23,6 +26,7 @@ import {
   INITIAL_ADMIN_USERS,
   INITIAL_CONTRACTS,
   INITIAL_DELINQUENCY_POLICY,
+  INITIAL_DOCUMENTS,
   INITIAL_FEE_RULES,
   INITIAL_FREIGHTS,
   INITIAL_ORGANIZATIONS,
@@ -32,7 +36,7 @@ import {
   INITIAL_SUBSCRIPTIONS,
 } from '../data/initialSeed';
 
-describe('NEXCARGA — Regras Comerciais, NEXGRID e NexCarga Control (FASE 1 & FASE 2)', () => {
+describe('NEXCARGA — Regras Comerciais, NEXGRID, Perfil e NEXCARGA TRUST', () => {
   it('Formata valores monetários no padrão brasileiro R$ 1.234,56 e datas DD/MM/AAAA', () => {
     assert.equal(formatBrl(12480), 'R$ 12.480,00');
     assert.equal(formatBrl(79.9), 'R$ 79,90');
@@ -128,15 +132,12 @@ describe('NEXCARGA — Regras Comerciais, NEXGRID e NexCarga Control (FASE 1 & F
     };
     const list = [privateFreight, INITIAL_FREIGHTS[1]];
 
-    // Outra empresa ou motorista não pode ver frete PRIVATE de org-vale-sa
     const driverVisible = filterFreightsByRoleVisibility(list, 'DRIVER', 'org-driver-joao');
     assert.equal(driverVisible.some((f) => f.id === 'fr-private-test'), false);
 
-    // A própria empresa dona do frete vê seu frete PRIVATE
     const ownerVisible = filterFreightsByRoleVisibility(list, 'COMPANY', 'org-vale-sa');
     assert.equal(ownerVisible.some((f) => f.id === 'fr-private-test'), true);
 
-    // SUPER_ADMIN possui visão global
     const adminVisible = filterFreightsByRoleVisibility(list, 'SUPER_ADMIN', 'org-pupa-labs');
     assert.equal(adminVisible.length, 2);
   });
@@ -145,7 +146,6 @@ describe('NEXCARGA — Regras Comerciais, NEXGRID e NexCarga Control (FASE 1 & F
     assert.equal(canRoleAccessSection('DRIVER', 'publicar-frete'), false);
     assert.equal(canRoleAccessSection('COMPANY', 'publicar-frete'), true);
 
-    // Somente SUPER_ADMIN pode conceder assinatura manual gratuita
     assert.equal(
       hasAdminPermission('SUPER_ADMIN', 'GRANT_MANUAL_SUBSCRIPTION', INITIAL_ROLE_PERMISSIONS),
       true
@@ -214,4 +214,103 @@ describe('NEXCARGA — Regras Comerciais, NEXGRID e NexCarga Control (FASE 1 & F
     assert.ok(cost.recommendedFreightValueBrl > cost.baseTransportCostBrl);
     assert.ok(cost.netDriverEarningsBrl < cost.recommendedFreightValueBrl);
   });
+
+  it('NEXCARGA TRUST — Mapeia documentos para os 6 buckets privados oficiais e impede autoaprovação', () => {
+    assert.equal(resolveOfficialStorageBucket('CNH', 'DRIVER'), 'driver-documents');
+    assert.equal(resolveOfficialStorageBucket('CARTAO_CNPJ', 'COMPANY'), 'company-documents');
+    assert.equal(resolveOfficialStorageBucket('CRLV', 'DRIVER'), 'driver-documents');
+    assert.equal(resolveOfficialStorageBucket('CT_E', 'CARRIER'), 'freight-attachments');
+
+    // Usuário comum não pode aprovar documentos
+    const companyTry = canReviewerApproveTrustDocument({
+      reviewerUserId: 'usr-carlos-company',
+      reviewerRole: 'COMPANY',
+      reviewerOrganizationId: 'org-vale-sa',
+      targetOrganizationId: 'org-driver-joao',
+      uploadedByUserId: 'usr-joao-driver',
+    });
+    assert.equal(companyTry.allowed, false);
+
+    // Mesmo perfil VERIFICATION não pode autoaprovar documento enviado por ele próprio
+    const selfTry = canReviewerApproveTrustDocument({
+      reviewerUserId: 'usr-helena-verify',
+      reviewerRole: 'VERIFICATION',
+      reviewerOrganizationId: 'org-pupa-labs',
+      targetOrganizationId: 'org-driver-joao',
+      uploadedByUserId: 'usr-helena-verify',
+    });
+    assert.equal(selfTry.allowed, false);
+    assert.ok(selfTry.reason?.includes('Violação de segurança'));
+
+    // Analista de homologação aprovando documento de terceiro
+    const validReviewer = canReviewerApproveTrustDocument({
+      reviewerUserId: 'usr-helena-verify',
+      reviewerRole: 'VERIFICATION',
+      reviewerOrganizationId: 'org-pupa-labs',
+      targetOrganizationId: 'org-driver-joao',
+      uploadedByUserId: 'usr-joao-driver',
+    });
+    assert.equal(validReviewer.allowed, true);
+  });
+
+  it('NEXCARGA TRUST — Concede selo VERIFIED somente com todos documentos vigentes e suspende para EXPIRED se houver documento vencido', () => {
+    const valeDocs = INITIAL_DOCUMENTS.filter((d) => d.organizationId === 'org-vale-sa');
+    const valeEval = evaluateNexCargaTrustStatus({
+      entityCategory: 'COMPANY_SHIPPER',
+      documents: valeDocs,
+      currentStatus: 'UNDER_REVIEW',
+      referenceDateIso: '2026-11-05',
+    });
+    assert.equal(valeEval.trustStatus, 'VERIFIED');
+    assert.equal(valeEval.verifiedBadge, true);
+
+    // Transportadora com ANTT vencido em 2026-09-01 deve ter status EXPIRED e selo suspenso (verifiedBadge = false)
+    const transrioDocs = INITIAL_DOCUMENTS.filter((d) => d.organizationId === 'org-transrio');
+    const transrioEval = evaluateNexCargaTrustStatus({
+      entityCategory: 'CARRIER',
+      documents: transrioDocs,
+      currentStatus: 'VERIFIED',
+      referenceDateIso: '2026-11-05',
+    });
+    assert.equal(transrioEval.trustStatus, 'EXPIRED');
+    assert.equal(transrioEval.verifiedBadge, false);
+  });
+
+  it('Selo Oficial NEXCARGA VERIFICADO — PNG RGBA real com fundo transparente (colorType 6) e interior preservado', async () => {
+    const fs = await import('node:fs');
+    const zlib = await import('node:zlib');
+    const filePath = 'public/assets/brand/nexcarga-verificado-oficial.png';
+    assert.equal(fs.existsSync(filePath), true, 'Arquivo oficial do selo deve existir');
+
+    const buf = fs.readFileSync(filePath);
+    const width = buf.readUInt32BE(16);
+    const height = buf.readUInt32BE(20);
+    const bitDepth = buf[24];
+    const colorType = buf[25];
+
+    assert.equal(width, 1254);
+    assert.equal(height, 1254);
+    assert.equal(bitDepth, 8);
+    assert.equal(colorType, 6, 'PNG deve ser RGBA com canal Alpha real (colorType === 6)');
+
+    // Decodifica primeira linha (canto externo 0,0) para confirmar alpha === 0
+    const idatChunks: Buffer[] = [];
+    let offset = 8;
+    while (offset < buf.length) {
+      const length = buf.readUInt32BE(offset);
+      const type = buf.subarray(offset + 4, offset + 8).toString('ascii');
+      if (type === 'IDAT') {
+        idatChunks.push(buf.subarray(offset + 8, offset + 8 + length));
+      }
+      offset += 12 + length;
+    }
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks));
+    const stride = 1 + width * 4;
+    // Pixel (0,0) no canto superior esquerdo (filter Sub/None na linha 0)
+    const cornerAlpha = raw[4];
+    assert.equal(cornerAlpha, 0, 'Fundo quadrado externo no canto (0,0) deve ser 100% transparente (alpha = 0)');
+    assert.ok(stride > 5000);
+  });
 });
+
+

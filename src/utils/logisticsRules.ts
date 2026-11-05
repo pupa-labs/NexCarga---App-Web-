@@ -6,17 +6,22 @@ import type {
   CostCalculationInput,
   CostCalculationResult,
   DelinquencyPolicy,
+  DocumentItem,
   FeeRuleItem,
   FreightItem,
   GeocodeAddressRequest,
   GeocodeAddressResponse,
   ImmutableFeeSnapshot,
   NavSectionId,
+  NexCargaTrustRequirement,
+  NexCargaTrustStatus,
   OrganizationItem,
   PartnerCommissionItem,
   PaymentTransactionItem,
   RolePermissionMatrix,
+  StorageBucketName,
   SubscriptionItem,
+  TrustEntityCategory,
   UserRole,
 } from '../types/nexcarga';
 
@@ -474,6 +479,8 @@ export function canRoleAccessSection(role: UserRole, section: NavSectionId): boo
     'nexcarga-docs',
     'motor-custos',
     'configuracoes',
+    'meu-perfil',
+    'nexcarga-trust',
   ];
 
   if (role === 'SUPER_ADMIN' || role === 'ADMIN') {
@@ -498,6 +505,8 @@ export function canRoleAccessSection(role: UserRole, section: NavSectionId): boo
       'nexcarga-docs',
       'motor-custos',
       'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
     ],
     DRIVER: [
       'dashboard',
@@ -513,6 +522,8 @@ export function canRoleAccessSection(role: UserRole, section: NavSectionId): boo
       'nexcarga-docs',
       'motor-custos',
       'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
     ],
     CARRIER: [
       'dashboard',
@@ -530,12 +541,41 @@ export function canRoleAccessSection(role: UserRole, section: NavSectionId): boo
       'nexcarga-docs',
       'motor-custos',
       'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
     ],
     SUPER_ADMIN: allSections,
     ADMIN: allSections,
-    FINANCE: ['dashboard', 'contratacoes', 'financeiro', 'parceiros', 'relatorios', 'configuracoes'],
-    SUPPORT: ['dashboard', 'fretes', 'propostas', 'operacoes', 'documentos', 'nexia', 'configuracoes'],
-    VERIFICATION: ['dashboard', 'documentos', 'nexia-verify', 'nexcarga-docs', 'configuracoes'],
+    FINANCE: [
+      'dashboard',
+      'contratacoes',
+      'financeiro',
+      'parceiros',
+      'relatorios',
+      'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
+    ],
+    SUPPORT: [
+      'dashboard',
+      'fretes',
+      'propostas',
+      'operacoes',
+      'documentos',
+      'nexia',
+      'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
+    ],
+    VERIFICATION: [
+      'dashboard',
+      'documentos',
+      'nexia-verify',
+      'nexcarga-docs',
+      'configuracoes',
+      'meu-perfil',
+      'nexcarga-trust',
+    ],
   };
 
   return (roleMatrix[role] || []).includes(section);
@@ -732,3 +772,318 @@ export function calculateAdminControlMetrics(params: {
     pendingCommissionsBrl,
   };
 }
+
+// ============================================================================
+// NEXCARGA TRUST — MOTOR OFICIAL DE VERIFICAÇÃO CADASTRAL & SELO VERIFICADO
+// ============================================================================
+
+/**
+ * Mapeia o bucket privado/público oficial do Supabase Storage conforme a categoria do arquivo
+ */
+export function resolveOfficialStorageBucket(
+  category: DocumentItem['category'] | 'PROFILE_IMAGE' | 'VEHICLE_PHOTO' | 'FREIGHT_ATTACHMENT',
+  ownerRole: UserRole | string
+): StorageBucketName {
+  if (category === 'PROFILE_IMAGE') return 'profile-images';
+  if (category === 'VEHICLE_PHOTO') return 'vehicle-images';
+  if (category === 'FREIGHT_ATTACHMENT' || category === 'NF_E' || category === 'CT_E' || category === 'MDF_E' || category === 'COMPROVANTE_ENTREGA') {
+    return 'freight-attachments';
+  }
+  if (ownerRole === 'DRIVER' || category === 'CNH') {
+    return 'driver-documents';
+  }
+  if (ownerRole === 'COMPANY' || ownerRole === 'CARRIER' || category === 'CONTRATO_SOCIAL' || category === 'CARTAO_CNPJ' || category === 'ANTT' || category === 'RNTRC' || category === 'CRLV') {
+    return 'company-documents';
+  }
+  return 'nexcarga-private';
+}
+
+/**
+ * Lista de documentos obrigatórios exigidos pelo NEXCARGA TRUST por categoria de entidade
+ */
+export function getRequiredTrustDocumentsForCategory(
+  entityCategory: TrustEntityCategory
+): NexCargaTrustRequirement[] {
+  switch (entityCategory) {
+    case 'DRIVER':
+      return [
+        {
+          category: 'CNH',
+          label: 'CNH Digital com EAR (Atividade Remunerada)',
+          bucket: 'driver-documents',
+          mandatory: true,
+          description: 'Carteira Nacional de Habilitação vigente (Categorias C, D ou E).',
+        },
+        {
+          category: 'RNTRC',
+          label: 'Registro Nacional RNTRC / ANTT (TAC)',
+          bucket: 'driver-documents',
+          mandatory: true,
+          description: 'Certificado RNTRC ativo junto à ANTT para transportador autônomo.',
+        },
+        {
+          category: 'CRLV',
+          label: 'CRLV-e do Veículo de Tração / Implemento',
+          bucket: 'driver-documents',
+          mandatory: true,
+          description: 'Certificado de Registro e Licenciamento anual vigente no SENATRAN.',
+        },
+      ];
+    case 'CARRIER':
+    case 'COMPANY_PROVIDER':
+      return [
+        {
+          category: 'CARTAO_CNPJ',
+          label: 'Comprovante de Inscrição CNPJ Ativo (Receita Federal)',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Cartão CNPJ ativo com CNAE compatível com transporte rodoviário de cargas.',
+        },
+        {
+          category: 'RNTRC',
+          label: 'Certificado RNTRC / ANTT — Empresa de Transporte (ETC)',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Habilitação ANTT vigente da transportadora e frota vinculada.',
+        },
+        {
+          category: 'CONTRATO_SOCIAL',
+          label: 'Contrato Social ou Última Alteração Consolidada',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Ato constitutivo registrado na Junta Comercial identificando os administradores.',
+        },
+      ];
+    case 'COMMERCIAL_PARTNER':
+      return [
+        {
+          category: 'CARTAO_CNPJ',
+          label: 'Cartão CNPJ ou Documento de Identificação do Parceiro',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Registro cadastral regular para recebimento de comissões comerciais.',
+        },
+        {
+          category: 'CONTRATO_SOCIAL',
+          label: 'Estatuto / Contrato Social ou Termo de Afiliação NexCarga',
+          bucket: 'nexcarga-private',
+          mandatory: true,
+          description: 'Instrumento jurídico de parceria homologado pela Pupa Labs.',
+        },
+      ];
+    case 'COMPANY_SHIPPER':
+    default:
+      return [
+        {
+          category: 'CARTAO_CNPJ',
+          label: 'Comprovante de Inscrição e Situação Cadastral CNPJ',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Inscrição estadual e federal ativa da empresa embarcadora.',
+        },
+        {
+          category: 'CONTRATO_SOCIAL',
+          label: 'Contrato Social / Estatuto e Procuração do Gestor Logístico',
+          bucket: 'company-documents',
+          mandatory: true,
+          description: 'Comprovação de poderes do responsável pela publicação e contratação de fretes.',
+        },
+      ];
+  }
+}
+
+/**
+ * Regra de Segurança Obrigatória:
+ * - O próprio usuário ou membros da mesma organização NUNCA podem aprovar sua própria documentação.
+ * - Somente perfis administrativos autorizados ('SUPER_ADMIN', 'ADMIN', 'VERIFICATION') podem aprovar/rejeitar.
+ */
+export function canReviewerApproveTrustDocument(params: {
+  reviewerUserId: string;
+  reviewerRole: UserRole;
+  reviewerOrganizationId: string;
+  targetOrganizationId: string;
+  uploadedByUserId?: string;
+}): { allowed: boolean; reason?: string } {
+  const {
+    reviewerUserId,
+    reviewerRole,
+    reviewerOrganizationId,
+    targetOrganizationId,
+    uploadedByUserId,
+  } = params;
+
+  if (!['SUPER_ADMIN', 'ADMIN', 'VERIFICATION'].includes(reviewerRole)) {
+    return {
+      allowed: false,
+      reason: `O perfil ${reviewerRole} não possui autorização para aprovar ou reprovar documentos no NEXCARGA TRUST.`,
+    };
+  }
+
+  if (uploadedByUserId && reviewerUserId === uploadedByUserId) {
+    return {
+      allowed: false,
+      reason: 'Violação de segurança: o usuário não pode aprovar a própria documentação.',
+    };
+  }
+
+  if (
+    reviewerRole !== 'SUPER_ADMIN' &&
+    reviewerOrganizationId === targetOrganizationId
+  ) {
+    return {
+      allowed: false,
+      reason: 'Violação de segregação de funções: analistas não podem homologar documentos da própria organização.',
+    };
+  }
+
+  return { allowed: true };
+}
+
+/**
+ * Avalia o estado oficial do NEXCARGA TRUST (8 estados possíveis) e elegibilidade do selo NEXCARGA VERIFICADO.
+ * Regras obrigatórias:
+ * - Selo só é exibido (verifiedBadge === true) quando trustStatus === 'VERIFIED'.
+ * - Se qualquer documento obrigatório aprovado estiver vencido (expiresAt < referenceDateIso),
+ *   o status transita automaticamente para 'EXPIRED' e o selo é suspenso (verifiedBadge = false).
+ */
+export function evaluateNexCargaTrustStatus(params: {
+  entityCategory: TrustEntityCategory;
+  documents: DocumentItem[];
+  currentStatus: NexCargaTrustStatus;
+  referenceDateIso?: string;
+  isManuallySuspended?: boolean;
+  suspensionReason?: string;
+}): {
+  trustStatus: NexCargaTrustStatus;
+  verifiedBadge: boolean;
+  pendingRequirements: string[];
+  expiredDocumentTitles: string[];
+  rejectedDocumentTitles: string[];
+  regularizationInstructions: string;
+} {
+  const {
+    entityCategory,
+    documents,
+    currentStatus,
+    referenceDateIso = '2026-11-05',
+    isManuallySuspended = false,
+    suspensionReason,
+  } = params;
+
+  const requirements = getRequiredTrustDocumentsForCategory(entityCategory);
+
+  if (isManuallySuspended || currentStatus === 'SUSPENDED') {
+    return {
+      trustStatus: 'SUSPENDED',
+      verifiedBadge: false,
+      pendingRequirements: requirements.map((r) => r.label),
+      expiredDocumentTitles: [],
+      rejectedDocumentTitles: [],
+      regularizationInstructions:
+        suspensionReason ||
+        'Sua verificação NEXCARGA TRUST encontra-se suspensa preventivamente. Envie documentação atualizada e solicite reavaliação.',
+    };
+  }
+
+  if (documents.length === 0) {
+    return {
+      trustStatus: 'NOT_SUBMITTED',
+      verifiedBadge: false,
+      pendingRequirements: requirements.map((r) => r.label),
+      expiredDocumentTitles: [],
+      rejectedDocumentTitles: [],
+      regularizationInstructions:
+        'Nenhum documento obrigatório foi enviado. Faça o upload dos documentos exigidos para iniciar a validação NEXCARGA TRUST.',
+    };
+  }
+
+  const expiredDocs = documents.filter(
+    (d) => d.expiresAt && d.expiresAt < referenceDateIso
+  );
+  if (expiredDocs.length > 0) {
+    return {
+      trustStatus: 'EXPIRED',
+      verifiedBadge: false,
+      pendingRequirements: expiredDocs.map((d) => `${d.title} (Vencido em ${formatDateBr(d.expiresAt)})`),
+      expiredDocumentTitles: expiredDocs.map((d) => d.title),
+      rejectedDocumentTitles: [],
+      regularizationInstructions:
+        'Um ou mais documentos obrigatórios estão vencidos. O selo NEXCARGA VERIFICADO foi suspenso até o envio e aprovação de documento vigente.',
+    };
+  }
+
+  const rejectedDocs = documents.filter((d) => d.verificationStatus === 'REJECTED');
+  if (rejectedDocs.length > 0) {
+    return {
+      trustStatus: currentStatus === 'REJECTED' ? 'REJECTED' : 'ACTION_REQUIRED',
+      verifiedBadge: false,
+      pendingRequirements: rejectedDocs.map(
+        (d) => `${d.title} (${d.rejectionReason || 'Requer reenvio legível'})`
+      ),
+      expiredDocumentTitles: [],
+      rejectedDocumentTitles: rejectedDocs.map((d) => d.title),
+      regularizationInstructions:
+        'Existem documentos reprovados na análise. Verifique o motivo da rejeição, substitua o arquivo e solicite nova análise.',
+    };
+  }
+
+  const missingMandatory = requirements.filter(
+    (req) =>
+      req.mandatory &&
+      !documents.some(
+        (d) =>
+          d.category === req.category &&
+          (d.verificationStatus === 'APPROVED' ||
+            d.verificationStatus === 'AI_PRE_CHECKED' ||
+            d.verificationStatus === 'PENDING')
+      )
+  );
+
+  const anyPendingHuman = documents.some(
+    (d) => d.verificationStatus === 'PENDING' || d.verificationStatus === 'AI_PRE_CHECKED'
+  );
+
+  if (anyPendingHuman) {
+    const nextState: NexCargaTrustStatus = documents.some(
+      (d) => d.verificationStatus === 'AI_PRE_CHECKED'
+    )
+      ? 'UNDER_REVIEW'
+      : 'PENDING';
+    return {
+      trustStatus: nextState,
+      verifiedBadge: false,
+      pendingRequirements: missingMandatory.map((m) => m.label),
+      expiredDocumentTitles: [],
+      rejectedDocumentTitles: [],
+      regularizationInstructions:
+        nextState === 'UNDER_REVIEW'
+          ? 'Seus documentos passaram pela pré-leitura da NexIA Verify e aguardam aprovação final do analista humano do NEXCARGA TRUST.'
+          : 'Documentos recebidos na fila de análise. Aguarde a homologação cadastral.',
+    };
+  }
+
+  // All submitted documents are APPROVED and none are expired
+  if (missingMandatory.length === 0 || currentStatus === 'VERIFIED') {
+    return {
+      trustStatus: 'VERIFIED',
+      verifiedBadge: true,
+      pendingRequirements: [],
+      expiredDocumentTitles: [],
+      rejectedDocumentTitles: [],
+      regularizationInstructions:
+        'Cadastro 100% homologado pelo NEXCARGA TRUST. O selo oficial NEXCARGA VERIFICADO está ativo em seu perfil e propostas.',
+    };
+  }
+
+  return {
+    trustStatus: 'ACTION_REQUIRED',
+    verifiedBadge: false,
+    pendingRequirements: missingMandatory.map((m) => m.label),
+    expiredDocumentTitles: [],
+    rejectedDocumentTitles: [],
+    regularizationInstructions: `Envie os documentos obrigatórios pendentes (${missingMandatory
+      .map((m) => m.category)
+      .join(', ')}) para concluir sua homologação.`,
+  };
+}
+

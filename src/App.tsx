@@ -16,6 +16,8 @@ import {
   Handshake,
   HelpCircle,
   Home,
+  KeyRound,
+  LogOut,
   MapPin,
   Menu,
   MessageSquare,
@@ -26,6 +28,7 @@ import {
   ShieldCheck,
   Sparkles,
   Truck,
+  UserCheck,
   Users,
   WifiOff,
   X,
@@ -43,14 +46,51 @@ import { NexGridMap } from './components/NexGridMap';
 import { NexIAPanel } from './components/NexIAPanel';
 import { FreightDetailModal, PublishFreightModal } from './components/ModalsAndForms';
 import { ModuleViews } from './components/ModuleViews';
+import {
+  NexCargaVerifiedBadge,
+  OFFICIAL_VERIFIED_SEAL_URL,
+  PROFILE_SUBTAB_STORAGE_KEY,
+  type ProfileSubTabId,
+  TRUST_STATUS_LABELS,
+} from './components/UserProfileAndTrustView';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall';
+
+const ACTIVE_SECTION_STORAGE_KEY = 'nexcarga_active_section';
+const VALID_PROFILE_SUBTABS: ProfileSubTabId[] = [
+  'profile-personal',
+  'organization-profile',
+  'security-password',
+  'preferences-notifications',
+  'account-settings',
+];
 
 export default function App() {
   const [data, setData] = useState<BootstrapResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
-  const [activeSection, setActiveSection] = useState<NavSectionId>('dashboard');
+  const [activeSection, setActiveSection] = useState<NavSectionId>(() => {
+    try {
+      const saved = window.localStorage.getItem(ACTIVE_SECTION_STORAGE_KEY) as NavSectionId | null;
+      if (saved) return saved;
+    } catch {
+      // ignore storage errors
+    }
+    return 'dashboard';
+  });
+  const [profileInitialTab, setProfileInitialTab] = useState<ProfileSubTabId>(() => {
+    try {
+      const saved = window.localStorage.getItem(PROFILE_SUBTAB_STORAGE_KEY) as ProfileSubTabId | null;
+      if (saved && VALID_PROFILE_SUBTABS.includes(saved)) {
+        return saved;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return 'profile-personal';
+  });
   const [mobileMenuOpen, setMobileMenuOpen] = useState<boolean>(false);
-  const [roleDropdownOpen, setRoleDropdownOpen] = useState<boolean>(false);
+  // Independent states: left sidebar Organization Switcher vs top-right Profile Menu
+  const [orgSwitcherOpen, setOrgSwitcherOpen] = useState<boolean>(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState<boolean>(false);
   const [publishModalOpen, setPublishModalOpen] = useState<boolean>(false);
   const [selectedFreight, setSelectedFreight] = useState<FreightItem | null>(null);
   const [searchOpen, setSearchOpen] = useState<boolean>(false);
@@ -90,18 +130,55 @@ export default function App() {
     return () => window.removeEventListener('gmp-quota-exceeded', onQuotaExceeded);
   }, []);
 
-  const handleSwitchRole = async (role: UserRole) => {
-    setRoleDropdownOpen(false);
+  useEffect(() => {
     try {
-      const res = await fetch('/api/auth/switch-role', {
+      window.localStorage.setItem(ACTIVE_SECTION_STORAGE_KEY, activeSection);
+    } catch {
+      // ignore storage errors
+    }
+  }, [activeSection]);
+
+  const navigateToProfileSubTab = (subTab: ProfileSubTabId) => {
+    setProfileInitialTab(subTab);
+    try {
+      window.localStorage.setItem(PROFILE_SUBTAB_STORAGE_KEY, subTab);
+    } catch {
+      // ignore storage errors
+    }
+    setActiveSection('meu-perfil');
+    setProfileMenuOpen(false);
+  };
+
+  const handleSwitchRole = async (role: UserRole, organizationId?: string) => {
+    setOrgSwitcherOpen(false);
+    setProfileMenuOpen(false);
+    try {
+      const res = await fetch('/api/auth/session', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ role }),
+        body: JSON.stringify({ role, organizationId }),
       });
       if (res.ok) {
         await fetchBootstrap();
         setActiveSection('dashboard');
-        showToast(`Sessão alternada para o perfil ${role}.`);
+        showToast(`Contexto organizacional alternado para ${role}.`);
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleLogoutSession = async () => {
+    setProfileMenuOpen(false);
+    try {
+      const res = await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      if (res.ok) {
+        await fetchBootstrap();
+        setActiveSection('dashboard');
+        showToast('Sessão encerrada com segurança e restaurada ao perfil padrão.');
       }
     } catch (err) {
       console.error(err);
@@ -224,20 +301,24 @@ export default function App() {
 
   const handleVerifyDocument = async (
     docId: string,
-    status: 'APPROVED' | 'REJECTED'
+    status: 'APPROVED' | 'REJECTED',
+    rejectionReason?: string
   ) => {
     const res = await fetch(`/api/documents/${docId}/verify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ status }),
+      body: JSON.stringify({ status, rejectionReason }),
     });
+    const json = await res.json().catch(() => ({}));
     if (res.ok) {
       await fetchBootstrap();
       showToast(
         status === 'APPROVED'
-          ? 'Documento homologado com sucesso!'
+          ? 'Documento homologado com sucesso no NEXCARGA TRUST!'
           : 'Documento reprovado na revisão humana.'
       );
+    } else if (json.error) {
+      showToast(json.error);
     }
   };
 
@@ -284,6 +365,9 @@ export default function App() {
   const {
     activeProfile,
     availableProfiles,
+    userProfile,
+    trustVerification,
+    trustHistory,
     kpis,
     freights,
     proposals,
@@ -334,6 +418,7 @@ export default function App() {
     label: string;
     icon: React.FC<{ className?: string }>;
   }> = [
+    { id: 'nexcarga-trust', label: 'NEXCARGA TRUST', icon: ShieldCheck },
     { id: 'nexia', label: 'NexIA', icon: Sparkles },
     { id: 'nexia-verify', label: 'NexIA Verify', icon: ShieldCheck },
     { id: 'nexcarga-docs', label: 'NexCarga Docs', icon: Cloud },
@@ -417,13 +502,17 @@ export default function App() {
             </button>
           </div>
 
-          {/* Organization / Role Switcher Card */}
+          {/* Left Sidebar Organization Context Switcher (Independent from Top-Right Profile Menu) */}
           <div className="relative">
             <button
               type="button"
-              onClick={() => setRoleDropdownOpen((prev) => !prev)}
-              aria-expanded={roleDropdownOpen}
-              aria-label="Selecionar organização ou perfil de acesso"
+              data-testid="sidebar-org-switcher-btn"
+              onClick={() => {
+                setOrgSwitcherOpen((prev) => !prev);
+                setProfileMenuOpen(false);
+              }}
+              aria-expanded={orgSwitcherOpen}
+              aria-label="Selecionar contexto de organização autorizada"
               className="w-full rounded-xl bg-[#1b1b1e] hover:bg-[#222226] border border-white/[0.09] p-2.5 flex items-center justify-between gap-2 text-left transition-colors cursor-pointer"
             >
               <div className="flex items-center gap-2.5 min-w-0">
@@ -442,16 +531,19 @@ export default function App() {
               <ChevronDown className="w-4 h-4 text-neutral-400 shrink-0" />
             </button>
 
-            {roleDropdownOpen && (
-              <div className="absolute left-0 right-0 mt-1.5 rounded-xl bg-[#1c1c20] border border-white/15 shadow-2xl p-1.5 z-50 space-y-1">
+            {orgSwitcherOpen && (
+              <div
+                data-testid="sidebar-org-switcher-dropdown"
+                className="absolute left-0 right-0 mt-1.5 rounded-xl bg-[#1c1c20] border border-white/15 shadow-2xl p-1.5 z-50 space-y-1"
+              >
                 <p className="px-2.5 py-1 text-[10px] font-semibold text-neutral-400">
-                  Alternar Experiência Multi-Role (RBAC):
+                  Alternar Organização / Contexto Autorizado:
                 </p>
                 {availableProfiles.map((prof) => (
                   <button
                     key={prof.userId}
                     type="button"
-                    onClick={() => handleSwitchRole(prof.role)}
+                    onClick={() => handleSwitchRole(prof.role, prof.organizationId)}
                     className={`w-full text-left px-2.5 py-2 rounded-lg text-xs flex items-center justify-between transition-colors cursor-pointer ${
                       prof.role === activeProfile.role
                         ? 'bg-[#FF8A00]/20 text-white font-semibold border border-[#FF8A00]/40'
@@ -712,29 +804,59 @@ export default function App() {
               <HelpCircle className="w-4 h-4" />
             </button>
 
-            {/* User Profile Button */}
+            {/* Top-Right User Profile Button (Independent from Left Sidebar Org Switcher) */}
             <button
               type="button"
-              onClick={() => setRoleDropdownOpen((prev) => !prev)}
-              aria-label={`Conta de ${activeProfile.userName}, ${activeProfile.userTitle}`}
+              data-testid="top-right-profile-button"
+              onClick={() => {
+                setProfileMenuOpen((prev) => !prev);
+                setOrgSwitcherOpen(false);
+                setNotificationsOpen(false);
+                setHelpOpen(false);
+              }}
+              aria-expanded={profileMenuOpen}
+              aria-label={`Menu de Perfil de ${activeProfile.userName}, ${activeProfile.userTitle}`}
               className="flex items-center gap-2.5 pl-1.5 pr-2.5 py-1 rounded-full bg-[#18181b]/90 hover:bg-[#242429] border border-white/10 transition-colors cursor-pointer"
             >
-              <div className="w-8 h-8 rounded-full overflow-hidden border border-[#FF8A00]/50 shrink-0 bg-[#292929]">
-                <svg viewBox="1662 24 48 48" className="w-full h-full">
-                  <image
-                    href="/assets/aistudio/file_00000000650c820eabe3f30ff870e8e4_1fab598d.png"
-                    x="0"
-                    y="0"
-                    width="1920"
-                    height="1080"
-                    preserveAspectRatio="none"
+              <div className="relative w-8 h-8 rounded-full overflow-hidden border border-[#FF8A00]/60 shrink-0 bg-[#292929]">
+                {userProfile.avatarUrl && userProfile.avatarUrl.startsWith('data:image') ? (
+                  <img
+                    src={userProfile.avatarUrl}
+                    alt={activeProfile.userName}
+                    className="w-full h-full object-cover"
                   />
-                </svg>
+                ) : (
+                  <svg viewBox="1662 24 48 48" className="w-full h-full">
+                    <image
+                      href="/assets/aistudio/file_00000000650c820eabe3f30ff870e8e4_1fab598d.png"
+                      x="0"
+                      y="0"
+                      width="1920"
+                      height="1080"
+                      preserveAspectRatio="none"
+                    />
+                  </svg>
+                )}
+                <span
+                  title={`Conta ${activeProfile.accountStatus || 'ACTIVE'}`}
+                  className="absolute bottom-0 right-0 w-2.5 h-2.5 rounded-full bg-emerald-400 border border-black"
+                />
               </div>
               <div className="hidden sm:block text-left">
-                <p className="text-xs font-semibold text-white leading-tight whitespace-nowrap">
-                  {activeProfile.userName}
-                </p>
+                <div className="flex items-center gap-1.5">
+                  <p className="text-xs font-semibold text-white leading-tight whitespace-nowrap">
+                    {activeProfile.userName}
+                  </p>
+                  {activeProfile.verifiedBadge &&
+                    activeProfile.trustStatus === 'VERIFIED' && (
+                      <img
+                        src={OFFICIAL_VERIFIED_SEAL_URL}
+                        alt="NEXCARGA VERIFICADO"
+                        title="Selo Oficial NEXCARGA VERIFICADO"
+                        className="w-4 h-4 object-contain shrink-0"
+                      />
+                    )}
+                </div>
                 <p className="text-[11px] text-neutral-400 leading-tight whitespace-nowrap">
                   {activeProfile.userTitle}
                 </p>
@@ -743,6 +865,145 @@ export default function App() {
             </button>
           </div>
         </header>
+
+        {/* Independent Top-Right User Profile Dropdown Menu (8 Official Items) */}
+        {profileMenuOpen && (
+          <div
+            data-testid="top-right-profile-dropdown"
+            className="fixed top-20 right-4 lg:right-6 z-50 w-80 rounded-2xl bg-[#16161a] border border-white/15 shadow-2xl p-3 text-xs space-y-2.5"
+          >
+            {/* Profile Summary Header */}
+            <div className="p-3 rounded-xl bg-[#1f1f25] border border-white/10 space-y-2">
+              <div className="flex items-center justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="text-sm font-bold text-white truncate">
+                    {userProfile.fullName}
+                  </p>
+                  <p className="text-[11px] text-neutral-300 truncate">
+                    {userProfile.jobTitle} • {userProfile.organizationName}
+                  </p>
+                </div>
+                <span className="px-2 py-0.5 rounded-md bg-emerald-500/20 text-emerald-300 text-[10px] font-bold shrink-0">
+                  {userProfile.accountStatus === 'ACTIVE' ? 'CONTA ATIVA' : userProfile.accountStatus}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between pt-1.5 border-t border-white/10">
+                <span className="text-[11px] text-neutral-400">
+                  Status Trust:{' '}
+                  <strong className="text-[#FF8A00]">
+                    {TRUST_STATUS_LABELS[userProfile.trustStatus].label}
+                  </strong>
+                </span>
+                <NexCargaVerifiedBadge
+                  verified={userProfile.verifiedBadge}
+                  trustStatus={userProfile.trustStatus}
+                  variant="inline"
+                />
+              </div>
+            </div>
+
+            {/* 8 Official Menu Items */}
+            <div className="space-y-1">
+              <button
+                type="button"
+                data-testid="profile-menu-item-meu-perfil"
+                onClick={() => navigateToProfileSubTab('profile-personal')}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <UserCheck className="w-4 h-4 text-[#FF8A00]" />
+                <span>1. Meu perfil</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-minha-organizacao"
+                onClick={() => navigateToProfileSubTab('organization-profile')}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <Building2 className="w-4 h-4 text-[#FF8A00]" />
+                <span>2. Minha organização</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-minha-verificacao"
+                onClick={() => {
+                  setActiveSection('nexcarga-trust');
+                  setProfileMenuOpen(false);
+                }}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center justify-between cursor-pointer"
+              >
+                <span className="flex items-center gap-2.5">
+                  <ShieldCheck className="w-4 h-4 text-[#FF8A00]" />
+                  <span>3. Minha verificação (NEXCARGA TRUST)</span>
+                </span>
+                {userProfile.verifiedBadge && (
+                  <img
+                    src={OFFICIAL_VERIFIED_SEAL_URL}
+                    alt="Verificado"
+                    className="w-4 h-4 object-contain"
+                  />
+                )}
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-documentos"
+                onClick={() => {
+                  setActiveSection('documentos');
+                  setProfileMenuOpen(false);
+                }}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <Folder className="w-4 h-4 text-[#FF8A00]" />
+                <span>4. Documentos</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-seguranca"
+                onClick={() => navigateToProfileSubTab('security-password')}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <KeyRound className="w-4 h-4 text-[#FF8A00]" />
+                <span>5. Segurança e senha</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-notificacoes"
+                onClick={() => navigateToProfileSubTab('preferences-notifications')}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <Bell className="w-4 h-4 text-[#FF8A00]" />
+                <span>6. Preferências e notificações</span>
+              </button>
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-configuracoes"
+                onClick={() => navigateToProfileSubTab('account-settings')}
+                className="w-full px-3 py-2 rounded-xl hover:bg-white/10 text-left text-neutral-200 hover:text-white flex items-center gap-2.5 cursor-pointer"
+              >
+                <Settings className="w-4 h-4 text-[#FF8A00]" />
+                <span>7. Configurações da conta</span>
+              </button>
+
+              <div className="my-1 border-t border-white/10" />
+
+              <button
+                type="button"
+                data-testid="profile-menu-item-sair"
+                onClick={handleLogoutSession}
+                className="w-full px-3 py-2 rounded-xl hover:bg-red-500/20 text-left text-red-300 hover:text-red-200 flex items-center gap-2.5 cursor-pointer"
+              >
+                <LogOut className="w-4 h-4 text-red-400" />
+                <span>8. Sair da conta</span>
+              </button>
+            </div>
+          </div>
+        )}
 
         {/* Notifications Popover */}
         {notificationsOpen && (
@@ -1058,6 +1319,11 @@ export default function App() {
             <ModuleViews
               activeSection={activeSection}
               activeProfile={activeProfile}
+              userProfile={userProfile}
+              trustVerification={trustVerification}
+              trustHistory={trustHistory}
+              profileInitialTab={profileInitialTab}
+              onNavigateSection={(sec) => handleNavClick(sec)}
               freights={freights}
               proposals={proposals}
               contracts={contracts}
